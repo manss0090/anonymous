@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import Conflict
+from telegram.error import BadRequest, Conflict, Forbidden, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -28,6 +28,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 DB_PATH = "bot_data.db"
 ADMIN_MENU_PREFIX = "admin:"
 USER_PAGE_SIZE = 10
+DB_TIMEOUT_SECONDS = 10
+USER_COOLDOWN_SECONDS = float(os.getenv("USER_COOLDOWN_SECONDS", "1.0"))
+BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", "20"))
+MAX_PENDING_MEDIA_GROUPS = int(os.getenv("MAX_PENDING_MEDIA_GROUPS", "1000"))
+PENDING_MEDIA_GROUP_TTL_SECONDS = int(os.getenv("PENDING_MEDIA_GROUP_TTL_SECONDS", "120"))
 
 WELCOME_TEXT = (
     "👋 Welcome to Anonymous Forward Bot.\n\n"
@@ -50,8 +55,16 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def db_connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=DB_TIMEOUT_SECONDS)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
 def init_db(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -82,12 +95,20 @@ def init_db(db_path: str) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen_at)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id INTEGER PRIMARY KEY,
+                banned_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
 def upsert_user(db_path: str, tg_user) -> None:
     now = utc_now_iso()
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO users(user_id, username, first_name, last_name, joined_at, last_seen_at)
@@ -111,7 +132,7 @@ def upsert_user(db_path: str, tg_user) -> None:
 
 
 def store_media_message(db_path: str, user_id: int, message_id: int, media_type: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO media_messages(user_id, message_id, media_type, created_at)
@@ -123,20 +144,20 @@ def store_media_message(db_path: str, user_id: int, message_id: int, media_type:
 
 
 def get_total_users(db_path: str) -> int:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
         return int(row[0] if row else 0)
 
 
 def get_total_media(db_path: str) -> int:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         row = conn.execute("SELECT COUNT(*) FROM media_messages").fetchone()
         return int(row[0] if row else 0)
 
 
 def get_users_page(db_path: str, page: int, page_size: int) -> list[tuple]:
     offset = page * page_size
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         return conn.execute(
             """
             SELECT user_id, username, first_name, last_name
@@ -153,13 +174,13 @@ def get_user_count(db_path: str) -> int:
 
 
 def get_all_user_ids(db_path: str) -> list[int]:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         rows = conn.execute("SELECT user_id FROM users").fetchall()
         return [int(r[0]) for r in rows]
 
 
 def get_user_media(db_path: str, user_id: int, limit: int = 10) -> list[tuple]:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         return conn.execute(
             """
             SELECT message_id, media_type, created_at
@@ -170,6 +191,46 @@ def get_user_media(db_path: str, user_id: int, limit: int = 10) -> list[tuple]:
             """,
             (user_id, limit),
         ).fetchall()
+
+
+def get_active_user_count(db_path: str, days: int = 7) -> int:
+    with db_connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM users
+            WHERE datetime(last_seen_at) >= datetime('now', ?)
+            """,
+            (f"-{days} days",),
+        ).fetchone()
+        return int(row[0] if row else 0)
+
+
+def ban_user(db_path: str, user_id: int) -> None:
+    with db_connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO banned_users(user_id, banned_at)
+            VALUES(?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET banned_at=excluded.banned_at
+            """,
+            (user_id, utc_now_iso()),
+        )
+        conn.commit()
+
+
+def unban_user(db_path: str, user_id: int) -> None:
+    with db_connect(db_path) as conn:
+        conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def is_banned(db_path: str, user_id: int) -> bool:
+    with db_connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM banned_users WHERE user_id = ? LIMIT 1", (user_id,)
+        ).fetchone()
+        return bool(row)
 
 
 def display_name(username: str | None, first_name: str | None, last_name: str | None) -> str:
@@ -189,6 +250,9 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("🖼️ Total Media", callback_data=f"{ADMIN_MENU_PREFIX}total_media"),
                 InlineKeyboardButton("📋 Users", callback_data=f"{ADMIN_MENU_PREFIX}users:0"),
+            ],
+            [
+                InlineKeyboardButton("📈 Weekly Active", callback_data=f"{ADMIN_MENU_PREFIX}active_users"),
             ],
         ]
     )
@@ -236,6 +300,36 @@ def get_media_type(message) -> str | None:
 
 def is_admin(update: Update, admin_user_id: int) -> bool:
     return bool(update.effective_user and update.effective_user.id == admin_user_id)
+
+
+def prune_pending_media_groups(context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending_groups = context.application.bot_data.setdefault("pending_media_groups", {})
+    if not pending_groups:
+        return
+
+    now = time.time()
+    expired_keys = [
+        key
+        for key, group in pending_groups.items()
+        if now - float(group.get("last_updated_at", now)) > PENDING_MEDIA_GROUP_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        group = pending_groups.pop(key, None)
+        if group and group.get("task"):
+            group["task"].cancel()
+
+    if len(pending_groups) <= MAX_PENDING_MEDIA_GROUPS:
+        return
+
+    overflow = len(pending_groups) - MAX_PENDING_MEDIA_GROUPS
+    oldest = sorted(
+        pending_groups.items(),
+        key=lambda item: float(item[1].get("created_at", now)),
+    )[:overflow]
+    for key, group in oldest:
+        pending_groups.pop(key, None)
+        if group.get("task"):
+            group["task"].cancel()
 
 
 async def flush_media_group(
@@ -380,6 +474,18 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    if data == f"{ADMIN_MENU_PREFIX}active_users":
+        total = get_total_users(db_path)
+        active = get_active_user_count(db_path, days=7)
+        inactive = max(total - active, 0)
+        await query.edit_message_text(
+            f"📈 Last 7 days\nActive users: {active}\nInactive users: {inactive}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")]]
+            ),
+        )
+        return
+
     if data.startswith(f"{ADMIN_MENU_PREFIX}users:"):
         page = int(data.split(":")[-1])
         await query.edit_message_text(
@@ -418,6 +524,86 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
 
+def parse_target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    if context.args:
+        candidate = context.args[0].strip()
+        if candidate.lstrip("-").isdigit():
+            return int(candidate)
+    if update.message and update.message.reply_to_message and update.message.reply_to_message.from_user:
+        return update.message.reply_to_message.from_user.id
+    return None
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin(update, context.bot_data["admin_user_id"]):
+        await update.message.reply_text("❌ You are not allowed to use this command.")
+        return
+
+    target_user_id = parse_target_user_id(update, context)
+    if target_user_id is None:
+        await update.message.reply_text("Usage: /ban <user_id> or reply to a user message with /ban")
+        return
+    if target_user_id == context.bot_data["admin_user_id"]:
+        await update.message.reply_text("⚠️ You cannot ban yourself.")
+        return
+
+    ban_user(context.bot_data["db_path"], target_user_id)
+    await update.message.reply_text(f"🚫 User {target_user_id} has been banned.")
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin(update, context.bot_data["admin_user_id"]):
+        await update.message.reply_text("❌ You are not allowed to use this command.")
+        return
+
+    target_user_id = parse_target_user_id(update, context)
+    if target_user_id is None:
+        await update.message.reply_text("Usage: /unban <user_id> or reply to a user message with /unban")
+        return
+
+    unban_user(context.bot_data["db_path"], target_user_id)
+    await update.message.reply_text(f"✅ User {target_user_id} has been unbanned.")
+
+
+async def broadcast_to_user(
+    context: ContextTypes.DEFAULT_TYPE,
+    sem: asyncio.Semaphore,
+    admin_user_id: int,
+    source_message_id: int,
+    user_id: int,
+) -> bool:
+    async with sem:
+        try:
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=admin_user_id,
+                message_id=source_message_id,
+            )
+            return True
+        except RetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after))
+            try:
+                await context.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=admin_user_id,
+                    message_id=source_message_id,
+                )
+                return True
+            except Exception as retry_exc:
+                logger.warning("Broadcast retry failed to user_id=%s: %s", user_id, retry_exc)
+                return False
+        except (Forbidden, BadRequest) as exc:
+            logger.warning("Broadcast blocked for user_id=%s: %s", user_id, exc)
+            return False
+        except Exception as exc:
+            logger.warning("Broadcast failed to user_id=%s: %s", user_id, exc)
+            return False
+
+
 async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -430,21 +616,23 @@ async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["awaiting_broadcast"] = False
     db_path = context.bot_data["db_path"]
     users = get_all_user_ids(db_path)
-    success = 0
-    failed = 0
+    sem = asyncio.Semaphore(max(1, BROADCAST_CONCURRENCY))
 
-    for user_id in users:
-        try:
-            await context.bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=admin_user_id,
-                message_id=update.message.message_id,
+    results = await asyncio.gather(
+        *[
+            broadcast_to_user(
+                context=context,
+                sem=sem,
+                admin_user_id=admin_user_id,
+                source_message_id=update.message.message_id,
+                user_id=user_id,
             )
-            success += 1
-            await asyncio.sleep(0.05)
-        except Exception as exc:
-            logger.warning("Broadcast failed to user_id=%s: %s", user_id, exc)
-            failed += 1
+            for user_id in users
+        ],
+        return_exceptions=False,
+    )
+    success = sum(1 for x in results if x)
+    failed = len(results) - success
 
     await update.message.reply_text(
         f"✅ Broadcast finished.\nDelivered: {success}\nFailed: {failed}",
@@ -458,27 +646,45 @@ async def anonymous_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is None:
         return
+    user_id = update.effective_user.id
+
+    if is_banned(context.bot_data["db_path"], user_id):
+        return
+
+    cooldown = context.application.bot_data.setdefault("user_cooldown", {})
+    now_ts = time.time()
+    last_seen_ts = float(cooldown.get(user_id, 0.0))
+    if now_ts - last_seen_ts < USER_COOLDOWN_SECONDS:
+        return
+    cooldown[user_id] = now_ts
 
     upsert_user(context.bot_data["db_path"], update.effective_user)
     media_type = get_media_type(update.message)
     if media_type:
         store_media_message(
             context.bot_data["db_path"],
-            user_id=update.effective_user.id,
+            user_id=user_id,
             message_id=update.message.message_id,
             media_type=media_type,
         )
 
     media_group_id = update.message.media_group_id
     if media_group_id:
+        prune_pending_media_groups(context)
         pending_groups = context.application.bot_data.setdefault("pending_media_groups", {})
         key = (chat_id, str(media_group_id))
         if key not in pending_groups:
             task = asyncio.create_task(
                 schedule_media_group_flush(context, chat_id, str(media_group_id))
             )
-            pending_groups[key] = {"message_ids": [], "task": task}
+            pending_groups[key] = {
+                "message_ids": [],
+                "task": task,
+                "created_at": now_ts,
+                "last_updated_at": now_ts,
+            }
         pending_groups[key]["message_ids"].append(update.message.message_id)
+        pending_groups[key]["last_updated_at"] = now_ts
         return
 
     # copy_message keeps it anonymous. If Telegram rejects copy for a media type,
@@ -548,7 +754,22 @@ async def main_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await handle_broadcast_input(update, context)
         return
     await anonymous_forward(update, context)
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
 
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+threading.Thread(target=run_server, daemon=True).start()
 
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -573,6 +794,8 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin))
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("unban", unban_command))
     application.add_handler(
         CallbackQueryHandler(admin_callbacks, pattern=f"^{ADMIN_MENU_PREFIX}")
     )

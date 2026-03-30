@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-DB_DSN_ENV_KEYS = ("postgresql://me_apn7_user:vTc6yRCXN6T5HJu4y0fMOL0M4lz1xUky@dpg-d758rfua2pns73b2aigg-a/me_apn7", "POSTGRES_DSN")
+DB_DSN_ENV_KEYS = ("DATABASE_URL", "POSTGRES_DSN")
 ADMIN_MENU_PREFIX = "admin:"
 USER_PAGE_SIZE = 10
 USER_COOLDOWN_SECONDS = float(os.getenv("USER_COOLDOWN_SECONDS", "1.0"))

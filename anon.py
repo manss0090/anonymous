@@ -1,1010 +1,1714 @@
-import logging
 import os
+import sqlite3
+import threading
 import time
-import asyncio
-from datetime import datetime, timezone
+import logging
+import re
+import csv
+from typing import Any, Dict, List, Optional, Tuple
 
-import psycopg
-from telegram import (
+import telebot
+from flask import Flask, abort, request
+from telebot.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaAudio,
     InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
-    Update,
-)
-from telegram.error import BadRequest, Conflict, Forbidden, RetryAfter
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
 )
 
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+BOT_TOKEN = "8647557552:AAEYbCBHPD6gdt4Zy2wlJzQSiTw9oYGdelY"
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN environment variable")
+
+DB_PATH = os.getenv("DB_PATH", "newanon.db")
+ADMIN_ID = 8305774350
+ADMIN_ID_ENV = os.getenv("ADMIN_ID", "").strip()
+LOG_FILE = os.getenv("LOG_FILE", "newanon.log").strip()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+FILE_IDS_CSV = os.getenv("FILE_IDS_CSV", "file_ids.csv").strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
+WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0").strip() or "0.0.0.0"
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+app = Flask(__name__)
+db_lock = threading.Lock()
+album_lock = threading.Lock()
+
+# (chat_id, media_group_id) -> {"messages": [Message, ...], "timer": Timer, "retries": int}
+album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
+admin_pending_actions: Dict[int, str] = {}
+send_lock = threading.Lock()
+file_ids_lock = threading.Lock()
+last_send_ts = 0.0
+MIN_SEND_GAP = float(os.getenv("MIN_SEND_GAP", "0.10"))
+SEND_MAX_RETRIES = int(os.getenv("SEND_MAX_RETRIES", "6"))
+SCHEDULE_BATCH_SIZE = 100
 
 
-DB_DSN_ENV_KEYS = ("DATABASE_URL", "POSTGRES_DSN")
-ADMIN_MENU_PREFIX = "admin:"
-USER_PAGE_SIZE = 10
-USER_COOLDOWN_SECONDS = float(os.getenv("USER_COOLDOWN_SECONDS", "1.0"))
-BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", "20"))
-MAX_PENDING_MEDIA_GROUPS = int(os.getenv("MAX_PENDING_MEDIA_GROUPS", "1000"))
-PENDING_MEDIA_GROUP_TTL_SECONDS = int(os.getenv("PENDING_MEDIA_GROUP_TTL_SECONDS", "120"))
-ALBUM_DEBOUNCE_SECONDS = float(os.getenv("ALBUM_DEBOUNCE_SECONDS", "2.5"))
-
-WELCOME_TEXT = (
-    "👋 Welcome to Anonymous Forward Bot.\n\n"
-    "Send me any message, photo, video, document, voice, or sticker and "
-    "I will forward it back to you anonymously."
-)
-ADMIN_TEXT = "🛠️ Admin Panel"
-MEDIA_TYPES = {
-    "photo",
-    "video",
-    "document",
-    "voice",
-    "audio",
-    "sticker",
-    "animation",
-}
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def get_db_dsn() -> str:
-    for key in DB_DSN_ENV_KEYS:
-        value = os.getenv(key)
-        if value:
-            return value
-    raise RuntimeError(
-        "Missing PostgreSQL DSN. Set DATABASE_URL or POSTGRES_DSN, "
-        "for example: postgresql://user:password@localhost:5432/dbname"
+def setup_logging() -> None:
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
+    logger = logging.getLogger()
+    logger.setLevel(level)
+    logger.handlers.clear()
+
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 
-def db_connect(db_dsn: str):
-    return psycopg.connect(db_dsn)
+def user_tag(user) -> str:
+    uname = user.username if user and user.username else "NoUsername"
+    uid = user.id if user else "NA"
+    return f"{uname}({uid})"
 
 
-def init_db(db_dsn: str) -> None:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
+def parse_retry_after_seconds(exc: Exception) -> int:
+    text = str(exc)
+    match = re.search(r"retry after\s+(\d+)", text, flags=re.IGNORECASE)
+    if match:
+        return max(1, int(match.group(1)))
+    return 1
+
+
+def safe_telegram_call(fn, op: str, max_retries: Optional[int] = None):
+    global last_send_ts
+    attempt = 0
+    retries = SEND_MAX_RETRIES if max_retries is None else max_retries
+    while True:
+        attempt += 1
+        try:
+            with send_lock:
+                now = time.time()
+                wait = MIN_SEND_GAP - (now - last_send_ts)
+                if wait > 0:
+                    time.sleep(wait)
+                result = fn()
+                last_send_ts = time.time()
+            return result
+        except Exception as e:
+            msg = str(e).lower()
+            is_flood = (
+                "too many requests" in msg
+                or "error code: 429" in msg
+                or "retry after" in msg
+            )
+            if is_flood and attempt <= retries:
+                retry_after = parse_retry_after_seconds(e)
+                delay = retry_after + 0.2
+                logging.warning(
+                    "rate_limit_wait | op=%s | attempt=%s | sleep=%.1fs | err=%s",
+                    op,
+                    attempt,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+                continue
+            raise
+
+
+# -----------------------------
+# Database helpers
+# -----------------------------
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+conn = db_connect()
+
+
+def init_db() -> None:
+    with db_lock:
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
+                user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                joined_at TIMESTAMPTZ NOT NULL,
-                last_seen_at TIMESTAMPTZ NOT NULL
+                first_seen INTEGER,
+                last_seen INTEGER
             )
             """
-            )
-            cur.execute(
+        )
+        conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS media_messages (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                message_id BIGINT NOT NULL,
-                media_type TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
             )
             """
-            )
-            cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_media_user ON media_messages(user_id)"
-            )
-            cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen_at)"
-            )
-            cur.execute(
+        )
+        conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS banned_users (
-                user_id BIGINT PRIMARY KEY,
-                banned_at TIMESTAMPTZ NOT NULL
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS forward_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                user_id INTEGER,
+                media_group_id TEXT,
+                created_at INTEGER,
+                status TEXT DEFAULT 'pending',
+                sent_at INTEGER,
+                fail_reason TEXT
             )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_ids (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id TEXT UNIQUE,
+                media_type TEXT,
+                user_id INTEGER,
+                username TEXT,
+                message_id INTEGER,
+                media_group_id TEXT,
+                created_at INTEGER
+            )
+            """
+        )
+        conn.commit()
+
+        defaults = {
+            "total_media": "0",
+            "firewall_enabled": "0",
+            "forward_enabled": "0",
+            "firewall_group_id": "",
+            "forward_group_id": "",
+            "firewall_join_link": "",
+            "forward_send_mode": "auto",
+            "schedule_break_seconds": "7200",
+        }
+        for key, value in defaults.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (key, value)
+            )
+
+        if ADMIN_ID_ENV:
+            for raw in ADMIN_ID_ENV.split(","):
+                raw = raw.strip()
+                if raw and raw.lstrip("-").isdigit():
+                    conn.execute(
+                        "INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (int(raw),)
+                    )
+        conn.commit()
+    ensure_file_ids_csv_header()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with db_lock:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with db_lock:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
         conn.commit()
 
 
-def upsert_user(db_dsn: str, tg_user) -> None:
-    now = utc_now_iso()
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
+def is_admin(user_id: int) -> bool:
+    with db_lock:
+        row = conn.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row)
+
+
+def upsert_user(user) -> None:
+    now = int(time.time())
+    with db_lock:
+        conn.execute(
             """
-            INSERT INTO users(user_id, username, first_name, last_name, joined_at, last_seen_at)
-            VALUES(%s, %s, %s, %s, %s, %s)
+            INSERT INTO users(user_id, username, first_seen, last_seen)
+            VALUES(?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                username=EXCLUDED.username,
-                first_name=EXCLUDED.first_name,
-                last_name=EXCLUDED.last_name,
-                last_seen_at=EXCLUDED.last_seen_at
+                username = excluded.username,
+                last_seen = excluded.last_seen
+            """,
+            (user.id, user.username or "", now, now),
+        )
+        conn.commit()
+
+
+def get_user_count() -> int:
+    with db_lock:
+        row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
+    return int(row["c"] if row else 0)
+
+
+def get_all_user_ids() -> List[int]:
+    with db_lock:
+        rows = conn.execute("SELECT user_id FROM users").fetchall()
+    return [int(r["user_id"]) for r in rows]
+
+def get_all_users() -> List[Tuple[int, str]]:
+    with db_lock:
+        rows = conn.execute("SELECT user_id, username FROM users").fetchall()
+    return [(int(r["user_id"]), r["username"] or "NoUsername") for r in rows]
+
+def inc_total_media(n: int = 1) -> None:
+    current = int(get_setting("total_media", "0") or "0")
+    set_setting("total_media", str(current + n))
+
+
+def get_total_media() -> int:
+    return int(get_setting("total_media", "0") or "0")
+
+
+def ensure_file_ids_csv_header() -> None:
+    with file_ids_lock:
+        if os.path.exists(FILE_IDS_CSV):
+            return
+        with open(FILE_IDS_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(
+                [
+                    "file_id",
+                    "media_type",
+                    "user_id",
+                    "username",
+                    "message_id",
+                    "media_group_id",
+                    "created_at",
+                ]
+            )
+
+
+def get_file_ids_count() -> int:
+    with db_lock:
+        row = conn.execute("SELECT COUNT(*) AS c FROM file_ids").fetchone()
+    return int(row["c"] if row else 0)
+
+def get_user_media_count(user_id: int) -> int:
+    with db_lock:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM file_ids WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return int(row["c"] if row else 0)
+
+def append_file_id_csv_row(
+    file_id: str,
+    media_type: str,
+    user_id: Optional[int],
+    username: str,
+    message_id: Optional[int],
+    media_group_id: Optional[str],
+    created_at: int,
+) -> None:
+    ensure_file_ids_csv_header()
+    with file_ids_lock:
+        with open(FILE_IDS_CSV, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(
+                [
+                    file_id,
+                    media_type,
+                    user_id if user_id is not None else "",
+                    username or "",
+                    message_id if message_id is not None else "",
+                    media_group_id or "",
+                    created_at,
+                ]
+            )
+
+
+def rebuild_file_ids_csv_from_db() -> None:
+    with db_lock:
+        rows = conn.execute(
+            """
+            SELECT file_id, media_type, user_id, username, message_id, media_group_id, created_at
+            FROM file_ids
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    with file_ids_lock:
+        with open(FILE_IDS_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(
+                [
+                    "file_id",
+                    "media_type",
+                    "user_id",
+                    "username",
+                    "message_id",
+                    "media_group_id",
+                    "created_at",
+                ]
+            )
+            for r in rows:
+                w.writerow(
+                    [
+                        r["file_id"],
+                        r["media_type"] or "",
+                        r["user_id"] if r["user_id"] is not None else "",
+                        r["username"] or "",
+                        r["message_id"] if r["message_id"] is not None else "",
+                        r["media_group_id"] or "",
+                        r["created_at"] if r["created_at"] is not None else "",
+                    ]
+                )
+
+
+def record_file_id_from_message(message) -> None:
+    media_type, file_id = media_kind_and_file_id(message)
+    if not file_id:
+        return
+    created_at = int(time.time())
+    uname = message.from_user.username if message.from_user and message.from_user.username else ""
+    uid = message.from_user.id if message.from_user else None
+    with db_lock:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO file_ids(
+                file_id, media_type, user_id, username, message_id, media_group_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                tg_user.id,
-                tg_user.username,
-                tg_user.first_name,
-                tg_user.last_name,
-                now,
-                now,
+                file_id,
+                media_type or "",
+                uid,
+                uname,
+                message.message_id,
+                message.media_group_id,
+                created_at,
             ),
         )
+        inserted = cur.rowcount
         conn.commit()
-
-
-def store_media_message(db_dsn: str, user_id: int, message_id: int, media_type: str) -> None:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-            """
-            INSERT INTO media_messages(user_id, message_id, media_type, created_at)
-            VALUES(%s, %s, %s, %s)
-            """,
-            (user_id, message_id, media_type, utc_now_iso()),
-        )
-        conn.commit()
-
-
-def get_total_users(db_dsn: str) -> int:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM users")
-            row = cur.fetchone()
-        return int(row[0] if row else 0)
-
-
-def get_total_media(db_dsn: str) -> int:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM media_messages")
-            row = cur.fetchone()
-        return int(row[0] if row else 0)
-
-
-def get_users_page(db_dsn: str, page: int, page_size: int) -> list[tuple]:
-    offset = page * page_size
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-            """
-            SELECT user_id, username, first_name, last_name
-            FROM users
-            ORDER BY last_seen_at DESC
-            LIMIT %s OFFSET %s
-            """,
-            (page_size, offset),
-            )
-            return cur.fetchall()
-
-
-def get_user_count(db_dsn: str) -> int:
-    return get_total_users(db_dsn)
-
-
-def get_all_user_ids(db_dsn: str) -> list[int]:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM users")
-            rows = cur.fetchall()
-        return [int(r[0]) for r in rows]
-
-
-def get_user_media(db_dsn: str, user_id: int, limit: int = 10) -> list[tuple]:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-            """
-            SELECT message_id, media_type, created_at
-            FROM media_messages
-            WHERE user_id = %s
-            ORDER BY id DESC
-            LIMIT %s
-            """,
-            (user_id, limit),
-            )
-            return cur.fetchall()
-
-
-def get_active_user_count(db_dsn: str, days: int = 7) -> int:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM users
-            WHERE last_seen_at >= (NOW() - (%s * INTERVAL '1 day'))
-            """,
-            (days,),
-            )
-            row = cur.fetchone()
-        return int(row[0] if row else 0)
-
-
-def ban_user(db_dsn: str, user_id: int) -> None:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-            """
-            INSERT INTO banned_users(user_id, banned_at)
-            VALUES(%s, %s)
-            ON CONFLICT(user_id) DO UPDATE SET banned_at=EXCLUDED.banned_at
-            """,
-            (user_id, utc_now_iso()),
-        )
-        conn.commit()
-
-
-def unban_user(db_dsn: str, user_id: int) -> None:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM banned_users WHERE user_id = %s", (user_id,))
-        conn.commit()
-
-
-def is_banned(db_dsn: str, user_id: int) -> bool:
-    with db_connect(db_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM banned_users WHERE user_id = %s LIMIT 1", (user_id,)
-            )
-            row = cur.fetchone()
-        return bool(row)
-
-
-def display_name(username: str | None, first_name: str | None, last_name: str | None) -> str:
-    if username:
-        return f"@{username}"
-    full_name = " ".join(x for x in [first_name, last_name] if x).strip()
-    return full_name or "Unknown User"
-
-
-def admin_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("📢 Broadcast", callback_data=f"{ADMIN_MENU_PREFIX}broadcast"),
-                InlineKeyboardButton("👥 Total Users", callback_data=f"{ADMIN_MENU_PREFIX}total_users"),
-            ],
-            [
-                InlineKeyboardButton("🖼️ Total Media", callback_data=f"{ADMIN_MENU_PREFIX}total_media"),
-                InlineKeyboardButton("📋 Users", callback_data=f"{ADMIN_MENU_PREFIX}users:0"),
-            ],
-            [
-                InlineKeyboardButton("📈 Weekly Active", callback_data=f"{ADMIN_MENU_PREFIX}active_users"),
-            ],
-        ]
-    )
-
-
-def users_keyboard(db_path: str, page: int) -> InlineKeyboardMarkup:
-    users = get_users_page(db_path, page=page, page_size=USER_PAGE_SIZE)
-    total_users = get_user_count(db_path)
-    rows: list[list[InlineKeyboardButton]] = []
-
-    for user_id, username, first_name, last_name in users:
-        name = display_name(username, first_name, last_name)
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    f"{name} ({user_id})",
-                    callback_data=f"{ADMIN_MENU_PREFIX}user:{user_id}",
-                )
-            ]
+    if inserted:
+        append_file_id_csv_row(
+            file_id=file_id,
+            media_type=media_type or "",
+            user_id=uid,
+            username=uname,
+            message_id=message.message_id,
+            media_group_id=message.media_group_id,
+            created_at=created_at,
         )
 
-    nav_row: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav_row.append(
-            InlineKeyboardButton("⬅️ Prev", callback_data=f"{ADMIN_MENU_PREFIX}users:{page - 1}")
-        )
-    if (page + 1) * USER_PAGE_SIZE < total_users:
-        nav_row.append(
-            InlineKeyboardButton("Next ➡️", callback_data=f"{ADMIN_MENU_PREFIX}users:{page + 1}")
-        )
-    if nav_row:
-        rows.append(nav_row)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")])
-    return InlineKeyboardMarkup(rows)
 
-
-def get_media_type(message) -> str | None:
-    if message.photo:
-        return "photo"
-    for media_type in MEDIA_TYPES - {"photo"}:
-        if getattr(message, media_type, None):
-            return media_type
-    return None
-
-
-def album_item_snapshot(message) -> dict | None:
-    if message.photo:
-        return {
-            "kind": "photo",
-            "file_id": message.photo[-1].file_id,
-            "caption": message.caption,
-            "caption_entities": message.caption_entities,
-        }
-    if message.video:
-        return {
-            "kind": "video",
-            "file_id": message.video.file_id,
-            "caption": message.caption,
-            "caption_entities": message.caption_entities,
-        }
-    if message.document:
-        return {
-            "kind": "document",
-            "file_id": message.document.file_id,
-            "caption": message.caption,
-            "caption_entities": message.caption_entities,
-        }
-    if message.audio:
-        return {
-            "kind": "audio",
-            "file_id": message.audio.file_id,
-            "caption": message.caption,
-            "caption_entities": message.caption_entities,
-        }
-    if message.animation:
-        return {
-            "kind": "animation",
-            "file_id": message.animation.file_id,
-            "caption": message.caption,
-            "caption_entities": message.caption_entities,
-        }
-    return None
-
-
-async def send_album_item_from_snapshot(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, item: dict
-) -> None:
-    kind = item.get("kind")
-    if kind == "photo":
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=item["file_id"],
-            caption=item.get("caption"),
-            caption_entities=item.get("caption_entities"),
-        )
-        return
-    if kind == "video":
-        await context.bot.send_video(
-            chat_id=chat_id,
-            video=item["file_id"],
-            caption=item.get("caption"),
-            caption_entities=item.get("caption_entities"),
-        )
-        return
-    if kind == "document":
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=item["file_id"],
-            caption=item.get("caption"),
-            caption_entities=item.get("caption_entities"),
-        )
-        return
-    if kind == "audio":
-        await context.bot.send_audio(
-            chat_id=chat_id,
-            audio=item["file_id"],
-            caption=item.get("caption"),
-            caption_entities=item.get("caption_entities"),
-        )
-        return
-    if kind == "animation":
-        await context.bot.send_animation(
-            chat_id=chat_id,
-            animation=item["file_id"],
-            caption=item.get("caption"),
-            caption_entities=item.get("caption_entities"),
-        )
-        return
-
-
-def build_input_media_from_snapshot(item: dict):
-    kind = item.get("kind")
-    common = {
-        "media": item["file_id"],
-        "caption": item.get("caption"),
-        "caption_entities": item.get("caption_entities"),
-    }
-    if kind == "photo":
-        return InputMediaPhoto(**common)
-    if kind == "video":
-        return InputMediaVideo(**common)
-    if kind == "document":
-        return InputMediaDocument(**common)
-    if kind == "audio":
-        return InputMediaAudio(**common)
-    return None
-
-
-def is_admin(update: Update, admin_user_id: int) -> bool:
-    return bool(update.effective_user and update.effective_user.id == admin_user_id)
-
-
-def prune_pending_media_groups(context: ContextTypes.DEFAULT_TYPE) -> None:
-    pending_groups = context.application.bot_data.setdefault("pending_media_groups", {})
-    if not pending_groups:
-        return
-
-    now = time.time()
-    expired_keys = [
-        key
-        for key, group in pending_groups.items()
-        if now - float(group.get("last_updated_at", now)) > PENDING_MEDIA_GROUP_TTL_SECONDS
-    ]
-    for key in expired_keys:
-        group = pending_groups.pop(key, None)
-        if group and group.get("task"):
-            group["task"].cancel()
-
-    if len(pending_groups) <= MAX_PENDING_MEDIA_GROUPS:
-        return
-
-    overflow = len(pending_groups) - MAX_PENDING_MEDIA_GROUPS
-    oldest = sorted(
-        pending_groups.items(),
-        key=lambda item: float(item[1].get("created_at", now)),
-    )[:overflow]
-    for key, group in oldest:
-        pending_groups.pop(key, None)
-        if group.get("task"):
-            group["task"].cancel()
-
-
-async def flush_media_group(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group_id: str
-) -> None:
-    key = (chat_id, media_group_id)
-    pending_groups = context.application.bot_data.setdefault("pending_media_groups", {})
-    group_data = pending_groups.pop(key, None)
-    if not group_data:
-        return
-
-    message_ids = list(dict.fromkeys(group_data["message_ids"]))
-    if not message_ids:
-        return
-    logger.info(
-        "Flushing album chat_id=%s media_group_id=%s count=%s",
-        chat_id,
-        media_group_id,
-        len(message_ids),
-    )
-    snapshots = group_data.get("snapshots", {})
-
-    media_group_payload = []
-
-    for message_id in message_ids:
-        item = snapshots.get(message_id)
-        if not item:
-            continue
-
-        media = build_input_media_from_snapshot(item)
-        if media:
-            media_group_payload.append(media)
-
-    # Fix captions
-    for i, media in enumerate(media_group_payload):
-        if i != 0:
-            media.caption = None
-            media.caption_entities = None
-
-    if len(media_group_payload) >= 2:
-        await context.bot.send_media_group(
-            chat_id=chat_id,
-            media=media_group_payload
-        )
-        return
-
-    media_group_payload = []
-    fallback_individual_items: list[dict] = []
-    for message_id in message_ids:
-        item = snapshots.get(message_id)
-        if not item:
-            continue
-        input_media = build_input_media_from_snapshot(item)
-        if input_media:
-            media_group_payload.append(input_media)
-        else:
-            fallback_individual_items.append(item)
-
-    if len(media_group_payload) >= 2:
-        try:
-            # send_media_group guarantees full album dispatch when payload is valid.
-            await context.bot.send_media_group(chat_id=chat_id, media=media_group_payload)
-            for item in fallback_individual_items:
-                await send_album_item_from_snapshot(context, chat_id, item)
-            return
-        except Exception as exc:
-            logger.warning(
-                "send_media_group failed for chat_id=%s media_group_id=%s: %s",
-                chat_id,
-                media_group_id,
-                exc,
-            )
-
-    # Final fallback: send each item separately.
-    for message_id in message_ids:
-        item = snapshots.get(message_id)
-        if not item:
+def import_file_ids_csv_bytes(file_bytes: bytes) -> Tuple[int, int]:
+    text = file_bytes.decode("utf-8", errors="replace")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return 0, 0
+    reader = csv.DictReader(lines)
+    added = 0
+    skipped = 0
+    now = int(time.time())
+    with db_lock:
+        for row in reader:
+            file_id = (row.get("file_id") or row.get("FILE_ID") or "").strip()
+            if not file_id:
+                skipped += 1
+                continue
+            media_type = (row.get("media_type") or "").strip()
+            user_id_raw = (row.get("user_id") or "").strip()
+            message_id_raw = (row.get("message_id") or "").strip()
+            created_at_raw = (row.get("created_at") or "").strip()
+            media_group_id = (row.get("media_group_id") or "").strip()
+            username = (row.get("username") or "").strip()
             try:
-                await context.bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=chat_id,
-                    message_id=message_id,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Fallback copy failed for chat_id=%s message_id=%s: %s",
-                    chat_id,
-                    message_id,
-                    exc,
-                )
-            continue
-        try:
-            await send_album_item_from_snapshot(context, chat_id, item)
-        except Exception as exc:
-            logger.warning(
-                "Snapshot send failed for chat_id=%s message_id=%s: %s",
-                chat_id,
-                message_id,
-                exc,
-            )
-
-
-async def schedule_media_group_flush(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group_id: str
-) -> None:
-    # Debounce flush so we wait until no new album item arrives recently.
-    key = (chat_id, media_group_id)
-    while True:
-        await asyncio.sleep(ALBUM_DEBOUNCE_SECONDS)
-        pending_groups = context.application.bot_data.setdefault("pending_media_groups", {})
-        group_data = pending_groups.get(key)
-        if not group_data:
-            return
-        last_updated = float(group_data.get("last_updated_at", 0.0))
-        if time.time() - last_updated >= ALBUM_DEBOUNCE_SECONDS:
-            await flush_media_group(context, chat_id, media_group_id)
-            return
-
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if isinstance(context.error, Conflict):
-        logger.warning(
-            "Telegram getUpdates conflict detected. "
-            "Another instance is polling with the same bot token."
-        )
-        return
-    logger.exception("Unhandled error while processing update: %s", context.error)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        upsert_user(context.bot_data["db_path"], update.effective_user)
-        if is_admin(update, context.bot_data["admin_user_id"]):
-            await update.message.reply_text(
-                "👋 Welcome Admin.\nClick the button below to open admin controls.",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "🛠️ Admin Panel",
-                                callback_data=f"{ADMIN_MENU_PREFIX}open_panel",
-                            )
-                        ]
-                    ]
+                user_id_val = int(user_id_raw) if user_id_raw else None
+            except Exception:
+                user_id_val = None
+            try:
+                message_id_val = int(message_id_raw) if message_id_raw else None
+            except Exception:
+                message_id_val = None
+            try:
+                created_at_val = int(created_at_raw) if created_at_raw else now
+            except Exception:
+                created_at_val = now
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO file_ids(
+                    file_id, media_type, user_id, username, message_id, media_group_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file_id,
+                    media_type,
+                    user_id_val,
+                    username,
+                    message_id_val,
+                    media_group_id,
+                    created_at_val,
                 ),
             )
-            return
-        await update.message.reply_text(WELCOME_TEXT)
+            if cur.rowcount:
+                added += 1
+            else:
+                skipped += 1
+        conn.commit()
+    rebuild_file_ids_csv_from_db()
+    return added, skipped
 
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_user_id = context.bot_data["admin_user_id"]
-    if not is_admin(update, admin_user_id):
-        if update.message:
-            await update.message.reply_text("❌ You are not allowed to access admin panel.")
-        return
-    if update.message:
-        await update.message.reply_text(ADMIN_TEXT, reply_markup=admin_menu_keyboard())
+def get_forward_send_mode() -> str:
+    mode = (get_setting("forward_send_mode", "auto") or "auto").strip().lower()
+    return "scheduled" if mode == "scheduled" else "auto"
 
 
-async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
-        return
-    admin_user_id = context.bot_data["admin_user_id"]
-    if not is_admin(update, admin_user_id):
-        await query.answer("Not allowed.", show_alert=True)
-        return
+def get_schedule_break_seconds() -> int:
+    try:
+        sec = int(get_setting("schedule_break_seconds", "7200") or "7200")
+    except Exception:
+        sec = 7200
+    return max(60, sec)
 
-    await query.answer()
-    data = query.data or ""
-    db_path = context.bot_data["db_path"]
 
-    if data in {
-        f"{ADMIN_MENU_PREFIX}back",
-        f"{ADMIN_MENU_PREFIX}open_panel",
-    }:
-        await query.edit_message_text(ADMIN_TEXT, reply_markup=admin_menu_keyboard())
-        return
-
-    if data == f"{ADMIN_MENU_PREFIX}broadcast":
-        context.user_data["awaiting_broadcast"] = True
-        await query.edit_message_text(
-            "📢 Send the message you want to broadcast to all users.\n"
-            "You can send text or media with caption.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")]]
+def enqueue_forward_message(message) -> None:
+    with db_lock:
+        conn.execute(
+            """
+            INSERT INTO forward_queue(from_chat_id, message_id, user_id, media_group_id, created_at, status)
+            VALUES(?, ?, ?, ?, ?, 'pending')
+            """,
+            (
+                message.chat.id,
+                message.message_id,
+                message.from_user.id if message.from_user else None,
+                message.media_group_id,
+                int(time.time()),
             ),
         )
-        return
+        conn.commit()
+    logging.info(
+        "queue_add | user=%s | from_chat=%s | msg_id=%s | media_group_id=%s",
+        user_tag(message.from_user),
+        message.chat.id,
+        message.message_id,
+        message.media_group_id,
+    )
 
-    if data == f"{ADMIN_MENU_PREFIX}total_users":
-        total = get_total_users(db_path)
-        await query.edit_message_text(
-            f"👥 Total users: {total}",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")]]
-            ),
-        )
-        return
 
-    if data == f"{ADMIN_MENU_PREFIX}total_media":
-        total = get_total_media(db_path)
-        await query.edit_message_text(
-            f"🖼️ Total media sent: {total}",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")]]
-            ),
-        )
+def enqueue_forward_messages(messages) -> None:
+    if not messages:
         return
-
-    if data == f"{ADMIN_MENU_PREFIX}active_users":
-        total = get_total_users(db_path)
-        active = get_active_user_count(db_path, days=7)
-        inactive = max(total - active, 0)
-        await query.edit_message_text(
-            f"📈 Last 7 days\nActive users: {active}\nInactive users: {inactive}",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back", callback_data=f"{ADMIN_MENU_PREFIX}back")]]
-            ),
-        )
-        return
-
-    if data.startswith(f"{ADMIN_MENU_PREFIX}users:"):
-        page = int(data.split(":")[-1])
-        await query.edit_message_text(
-            "📋 Users list:",
-            reply_markup=users_keyboard(db_path, page),
-        )
-        return
-
-    if data.startswith(f"{ADMIN_MENU_PREFIX}user:"):
-        user_id = int(data.split(":")[-1])
-        media_records = get_user_media(db_path, user_id=user_id, limit=10)
-        if not media_records:
-            await query.message.reply_text(f"ℹ️ User {user_id} has no media records.")
-        else:
-            await query.message.reply_text(
-                f"🗂️ Last {len(media_records)} media messages from user {user_id}:"
+    now = int(time.time())
+    rows = []
+    for m in messages:
+        rows.append(
+            (
+                m.chat.id,
+                m.message_id,
+                m.from_user.id if m.from_user else None,
+                m.media_group_id,
+                now,
             )
-            for message_id, media_type, created_at in media_records:
-                try:
-                    await context.bot.copy_message(
-                        chat_id=admin_user_id,
-                        from_chat_id=user_id,
-                        message_id=message_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to copy media message_id=%s from user_id=%s: %s",
-                        message_id,
-                        user_id,
-                        exc,
-                    )
-                    await query.message.reply_text(
-                        f"⚠️ Failed: {media_type} ({message_id}) at {created_at}"
-                    )
-        await query.message.reply_text("🛠️ Admin Panel", reply_markup=admin_menu_keyboard())
+        )
+    with db_lock:
+        conn.executemany(
+            """
+            INSERT INTO forward_queue(from_chat_id, message_id, user_id, media_group_id, created_at, status)
+            VALUES(?, ?, ?, ?, ?, 'pending')
+            """,
+            rows,
+        )
+        conn.commit()
+    logging.info(
+        "queue_add_batch | user=%s | items=%s | media_group_id=%s",
+        user_tag(messages[0].from_user),
+        len(messages),
+        messages[0].media_group_id,
+    )
+
+
+def get_pending_queue_count() -> int:
+    with db_lock:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM forward_queue WHERE status = 'pending'"
+        ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def fetch_pending_queue(limit: int) -> List[sqlite3.Row]:
+    with db_lock:
+        rows = conn.execute(
+            """
+            SELECT id, from_chat_id, message_id, user_id, media_group_id
+            FROM forward_queue
+            WHERE status = 'pending'
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return rows
+
+
+def mark_queue_sent(row_id: int) -> None:
+    with db_lock:
+        conn.execute(
+            "UPDATE forward_queue SET status='sent', sent_at=? WHERE id=?",
+            (int(time.time()), row_id),
+        )
+        conn.commit()
+
+
+def mark_queue_failed(row_id: int, reason: str) -> None:
+    with db_lock:
+        conn.execute(
+            "UPDATE forward_queue SET status='failed', fail_reason=? WHERE id=?",
+            (reason[:500], row_id),
+        )
+        conn.commit()
+
+
+# -----------------------------
+# UI helpers
+# -----------------------------
+def bool_setting(key: str) -> bool:
+    return get_setting(key, "0") == "1"
+
+
+def main_admin_keyboard() -> InlineKeyboardMarkup:
+    fw = "ON" if bool_setting("firewall_enabled") else "OFF"
+    fwd = "ON" if bool_setting("forward_enabled") else "OFF"
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🏆 leaderboard", callback_data="admin:stats"),
+        InlineKeyboardButton("👥 Users List", callback_data="admin:users_list"),
+    )
+    kb.add(
+        InlineKeyboardButton("📊 Stats", callback_data="admin:stats"),
+        InlineKeyboardButton("📢 Broadcast", callback_data="admin:broadcast"),
+    )
+    kb.add(
+        InlineKeyboardButton(f"🔥 Firewall: {fw}", callback_data="admin:toggle_firewall"),
+        InlineKeyboardButton(f"📤 Forward: {fwd}", callback_data="admin:toggle_forward"),
+    )
+    kb.add(
+        InlineKeyboardButton("📮 Media Send", callback_data="admin:media_send_menu"),
+        InlineKeyboardButton("💾 File IDs", callback_data="admin:file_ids_menu"),
+    )
+    kb.add(
+        InlineKeyboardButton("⚙️ Set Group", callback_data="admin:set_group_menu"),
+        InlineKeyboardButton("🧾 Recent Logs", callback_data="admin:recent_logs"),
+    )
+    kb.add(InlineKeyboardButton("🔄 Refresh", callback_data="admin:refresh"))
+    return kb
+
+
+def media_send_keyboard() -> InlineKeyboardMarkup:
+    mode = get_forward_send_mode()
+    auto_label = "✅ Automatic" if mode == "auto" else "⚡ Automatic"
+    sch_label = "✅ Scheduled" if mode == "scheduled" else "⏱ Scheduled"
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(auto_label, callback_data="admin:send_mode_auto"),
+        InlineKeyboardButton(sch_label, callback_data="admin:send_mode_scheduled"),
+    )
+    kb.add(InlineKeyboardButton("🕒 Set Break Time", callback_data="admin:set_break_time"))
+    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="admin:back_main"))
+    return kb
+
+
+def file_ids_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📤 Export CSV", callback_data="admin:file_ids_export"),
+        InlineKeyboardButton("📥 Import CSV", callback_data="admin:file_ids_import"),
+    )
+    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="admin:back_main"))
+    return kb
+
+def group_menu_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🛡 Set Firewall Group", callback_data="admin:set_fw_group"))
+    kb.add(InlineKeyboardButton("📥 Set Forward Group", callback_data="admin:set_fwd_group"))
+    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="admin:back_main"))
+    return kb
+
+
+def firewall_user_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    join_link = get_or_create_join_link()
+    if join_link:
+        kb.add(InlineKeyboardButton("➕ Join Required Group", url=join_link))
+    kb.add(InlineKeyboardButton("✅ I've Joined", callback_data="user:check_join"))
+    return kb
+
+
+def panel_text() -> str:
+    fw_enabled = "ON" if bool_setting("firewall_enabled") else "OFF"
+    fwd_enabled = "ON" if bool_setting("forward_enabled") else "OFF"
+    send_mode = get_forward_send_mode().upper()
+    break_hours = round(get_schedule_break_seconds() / 3600, 2)
+    q_pending = get_pending_queue_count()
+    file_ids_count = get_file_ids_count()
+    fw_gid = get_setting("firewall_group_id", "") or "Not set"
+    fwd_gid = get_setting("forward_group_id", "") or "Not set"
+
+    return (
+        "<b>👑 Admin Panel</b>\n\n"
+        f"<b>📊 Users:</b> {get_user_count()}\n"
+        f"<b>🎞 Total Media:</b> {get_total_media()}\n"
+        f"<b>🔥 Firewall:</b> {fw_enabled}\n"
+        f"<b>📤 Forward Mode:</b> {fwd_enabled}\n"
+        f"<b>📮 Send Type:</b> {send_mode}\n"
+        f"<b>⏱ Break Hours:</b> {break_hours}\n"
+        f"<b>📦 Queue Pending:</b> {q_pending}\n"
+        f"<b>💾 File IDs:</b> {file_ids_count}\n"
+        f"<b>🛡 Firewall Group:</b> <code>{fw_gid}</code>\n"
+        f"<b>📥 Forward Group:</b> <code>{fwd_gid}</code>"
+    )
+
+
+def send_admin_panel(chat_id: int) -> None:
+    bot.send_message(chat_id, panel_text(), reply_markup=main_admin_keyboard())
+
+
+# -----------------------------
+# Firewall helpers
+# -----------------------------
+def get_or_create_join_link() -> str:
+    cached = get_setting("firewall_join_link", "")
+    if cached:
+        return cached
+
+    raw_gid = get_setting("firewall_group_id", "")
+    if not raw_gid:
+        return ""
+
+    try:
+        gid = int(raw_gid)
+    except ValueError:
+        return ""
+
+    try:
+        inv = bot.create_chat_invite_link(gid, name="Firewall Access", creates_join_request=True)
+        link = inv.invite_link
+        set_setting("firewall_join_link", link)
+        return link
+    except Exception:
+        return ""
+
+
+def user_is_group_member(user_id: int, group_id: int) -> bool:
+    try:
+        member = bot.get_chat_member(group_id, user_id)
+        return member.status in ("creator", "administrator", "member", "restricted")
+    except Exception:
+        return False
+
+
+def firewall_allows(message, user_id: Optional[int] = None) -> bool:
+    if not bool_setting("firewall_enabled"):
+        return True
+
+    raw_gid = get_setting("firewall_group_id", "")
+    if not raw_gid:
+        bot.reply_to(
+            message,
+            "🚫 Firewall is ON but no firewall group is set by admin yet.",
+        )
+        return False
+
+    group_id = int(raw_gid)
+    uid = user_id if user_id is not None else message.from_user.id
+    if user_is_group_member(uid, group_id):
+        return True
+
+    bot.reply_to(
+        message,
+        "🔥 Firewall is ON. Join the required group first, then tap \"I've Joined\".",
+        reply_markup=firewall_user_keyboard(),
+    )
+    return False
+
+
+# -----------------------------
+# Message copying helpers
+# -----------------------------
+def media_kind_and_file_id(message) -> Tuple[Optional[str], Optional[str]]:
+    if message.photo:
+        return "photo", message.photo[-1].file_id
+    if message.video:
+        return "video", message.video.file_id
+    if message.document:
+        return "document", message.document.file_id
+    if message.audio:
+        return "audio", message.audio.file_id
+    if message.voice:
+        return "voice", message.voice.file_id
+    if message.sticker:
+        return "sticker", message.sticker.file_id
+    if message.animation:
+        return "animation", message.animation.file_id
+    return None, None
+
+
+def is_media_message(message) -> bool:
+    kind, _ = media_kind_and_file_id(message)
+    return kind is not None
+
+
+def send_clean_single(chat_id: int, message) -> None:
+    logging.info(
+        "single_send_start | user=%s | chat_id=%s | msg_id=%s | type=%s | media_group_id=%s",
+        user_tag(message.from_user),
+        chat_id,
+        message.message_id,
+        message.content_type,
+        message.media_group_id,
+    )
+    if message.content_type == "text":
+        try:
+            safe_telegram_call(
+                lambda: bot.send_message(chat_id, message.text),
+                op=f"user_text:{chat_id}:{message.message_id}",
+            )
+            logging.info(
+                "single_send_ok | user=%s | chat_id=%s | msg_id=%s | type=text",
+                user_tag(message.from_user),
+                chat_id,
+                message.message_id,
+            )
+        except Exception as e:
+            logging.exception(
+                "single_send_fail | user=%s | chat_id=%s | msg_id=%s | type=text | err=%s",
+                user_tag(message.from_user),
+                chat_id,
+                message.message_id,
+                e,
+            )
         return
 
+    if message.content_type in (
+        "photo",
+        "video",
+        "document",
+        "audio",
+        "voice",
+        "sticker",
+        "animation",
+    ):
+        try:
+            safe_telegram_call(
+                lambda: bot.copy_message(chat_id, chat_id, message.message_id),
+                op=f"user_copy:{chat_id}:{message.message_id}",
+            )
+            inc_total_media(1)
+            logging.info(
+                "single_send_ok | user=%s | chat_id=%s | msg_id=%s | type=%s",
+                user_tag(message.from_user),
+                chat_id,
+                message.message_id,
+                message.content_type,
+            )
+        except Exception as e:
+            logging.exception(
+                "single_send_fail | user=%s | chat_id=%s | msg_id=%s | type=%s | err=%s",
+                user_tag(message.from_user),
+                chat_id,
+                message.message_id,
+                message.content_type,
+                e,
+            )
+        return
 
-def parse_target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
-    if context.args:
-        candidate = context.args[0].strip()
-        if candidate.lstrip("-").isdigit():
-            return int(candidate)
-    if update.message and update.message.reply_to_message and update.message.reply_to_message.from_user:
-        return update.message.reply_to_message.from_user.id
+    # if message.caption:
+    #     bot.send_message(chat_id, message.caption)
+
+
+def build_input_media(msg):
+    if msg.photo:
+        return InputMediaPhoto(msg.photo[-1].file_id)
+    if msg.video:
+        return InputMediaVideo(msg.video.file_id)
+    if msg.document:
+        return InputMediaDocument(msg.document.file_id)
+    if msg.audio:
+        return InputMediaAudio(msg.audio.file_id)
     return None
 
 
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if not is_admin(update, context.bot_data["admin_user_id"]):
-        await update.message.reply_text("❌ You are not allowed to use this command.")
-        return
+def forward_to_group_header(user) -> str:
+    uname = f"@{user.username}" if user.username else "NoUsername"
+    return f"👤 User: {uname} | <code>{user.id}</code>"
 
-    target_user_id = parse_target_user_id(update, context)
-    if target_user_id is None:
-        await update.message.reply_text("Usage: /ban <user_id> or reply to a user message with /ban")
-        return
-    if target_user_id == context.bot_data["admin_user_id"]:
-        await update.message.reply_text("⚠️ You cannot ban yourself.")
+
+def maybe_forward_single_to_group(message) -> None:
+    if not bool_setting("forward_enabled"):
         return
 
-    ban_user(context.bot_data["db_path"], target_user_id)
-    await update.message.reply_text(f"🚫 User {target_user_id} has been banned.")
-
-
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if not is_admin(update, context.bot_data["admin_user_id"]):
-        await update.message.reply_text("❌ You are not allowed to use this command.")
+    if get_forward_send_mode() == "scheduled":
+        enqueue_forward_message(message)
         return
 
-    target_user_id = parse_target_user_id(update, context)
-    if target_user_id is None:
-        await update.message.reply_text("Usage: /unban <user_id> or reply to a user message with /unban")
+    raw_gid = get_setting("forward_group_id", "")
+    if not raw_gid:
         return
 
-    unban_user(context.bot_data["db_path"], target_user_id)
-    await update.message.reply_text(f"✅ User {target_user_id} has been unbanned.")
-
-
-async def broadcast_to_user(
-    context: ContextTypes.DEFAULT_TYPE,
-    sem: asyncio.Semaphore,
-    admin_user_id: int,
-    source_message_id: int,
-    user_id: int,
-) -> bool:
-    async with sem:
-        try:
-            await context.bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=admin_user_id,
-                message_id=source_message_id,
-            )
-            return True
-        except RetryAfter as exc:
-            await asyncio.sleep(float(exc.retry_after))
-            try:
-                await context.bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=admin_user_id,
-                    message_id=source_message_id,
-                )
-                return True
-            except Exception as retry_exc:
-                logger.warning("Broadcast retry failed to user_id=%s: %s", user_id, retry_exc)
-                return False
-        except (Forbidden, BadRequest) as exc:
-            logger.warning("Broadcast blocked for user_id=%s: %s", user_id, exc)
-            return False
-        except Exception as exc:
-            logger.warning("Broadcast failed to user_id=%s: %s", user_id, exc)
-            return False
-
-
-async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    admin_user_id = context.bot_data["admin_user_id"]
-    if not is_admin(update, admin_user_id):
-        return
-    if not context.user_data.get("awaiting_broadcast"):
-        return
-
-    context.user_data["awaiting_broadcast"] = False
-    db_path = context.bot_data["db_path"]
-    users = get_all_user_ids(db_path)
-    sem = asyncio.Semaphore(max(1, BROADCAST_CONCURRENCY))
-
-    results = await asyncio.gather(
-        *[
-            broadcast_to_user(
-                context=context,
-                sem=sem,
-                admin_user_id=admin_user_id,
-                source_message_id=update.message.message_id,
-                user_id=user_id,
-            )
-            for user_id in users
-        ],
-        return_exceptions=False,
-    )
-    success = sum(1 for x in results if x)
-    failed = len(results) - success
-
-    await update.message.reply_text(
-        f"✅ Broadcast finished.\nDelivered: {success}\nFailed: {failed}",
-        reply_markup=admin_menu_keyboard(),
-    )
-
-
-async def anonymous_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        return
-    user_id = update.effective_user.id
-
-    if is_banned(context.bot_data["db_path"], user_id):
-        return
-
-    upsert_user(context.bot_data["db_path"], update.effective_user)
-    media_type = get_media_type(update.message)
-    if media_type:
-        store_media_message(
-            context.bot_data["db_path"],
-            user_id=user_id,
-            message_id=update.message.message_id,
-            media_type=media_type,
+    gid = int(raw_gid)
+    try:
+        logging.info(
+            "forward_group_single_start | user=%s | from_chat=%s | to_group=%s | msg_id=%s | type=%s",
+            user_tag(message.from_user),
+            message.chat.id,
+            gid,
+            message.message_id,
+            message.content_type,
+        )
+        safe_telegram_call(
+            lambda: bot.forward_message(gid, message.chat.id, message.message_id),
+            op=f"fwd_as_is:{gid}:{message.message_id}",
+        )
+        logging.info(
+            "forward_group_single_ok | user=%s | to_group=%s | msg_id=%s",
+            user_tag(message.from_user),
+            gid,
+            message.message_id,
+        )
+    except Exception:
+        logging.exception(
+            "forward_group_single_fail | user=%s | to_group=%s | msg_id=%s",
+            user_tag(message.from_user),
+            gid,
+            message.message_id,
         )
 
-    media_group_id = update.message.media_group_id
-    now_ts = time.time()
-    if media_group_id:
-        prune_pending_media_groups(context)
-        pending_groups = context.application.bot_data.setdefault("pending_media_groups", {})
-        key = (chat_id, str(media_group_id))
-        if key not in pending_groups:
-            task = asyncio.create_task(
-                schedule_media_group_flush(context, chat_id, str(media_group_id))
-            )
-            pending_groups[key] = {
-                "message_ids": [],
-                "task": task,
-                "created_at": now_ts,
-                "last_updated_at": now_ts,
-                "snapshots": {},
-            }
-        pending_groups[key]["message_ids"].append(update.message.message_id)
-        pending_groups[key]["last_updated_at"] = now_ts
-        item = album_item_snapshot(update.message)
-        if item:
-            pending_groups[key]["snapshots"][update.message.message_id] = item
-        logger.info(
-            "Queued album item chat_id=%s media_group_id=%s message_id=%s size=%s",
+
+def maybe_forward_album_to_group(messages, gid: int, media_group_id: str) -> None:
+    if not messages:
+        return
+    if get_forward_send_mode() == "scheduled":
+        enqueue_forward_messages(messages)
+        return
+
+    src_chat_id = messages[0].chat.id
+    message_ids = [m.message_id for m in messages]
+    try:
+        logging.info(
+            "forward_group_album_start | user=%s | from_chat=%s | to_group=%s | media_group_id=%s | items=%s",
+            user_tag(messages[0].from_user),
+            src_chat_id,
+            gid,
+            media_group_id,
+            len(message_ids),
+        )
+        safe_telegram_call(
+            lambda: bot.forward_messages(gid, src_chat_id, message_ids),
+            op=f"fwd_album_batch:{gid}:{media_group_id}:{len(message_ids)}",
+            max_retries=20,
+        )
+        logging.info(
+            "forward_group_album_ok | user=%s | to_group=%s | media_group_id=%s | items=%s",
+            user_tag(messages[0].from_user),
+            gid,
+            media_group_id,
+            len(message_ids),
+        )
+    except Exception:
+        logging.exception(
+            "forward_group_album_fail | user=%s | to_group=%s | media_group_id=%s | fallback=single",
+            user_tag(messages[0].from_user),
+            gid,
+            media_group_id,
+        )
+        for m in messages:
+            maybe_forward_single_to_group(m)
+
+
+def delete_message_by_ids(chat_id: int, message_id: int, context: str = "") -> None:
+    try:
+        safe_telegram_call(
+            lambda: bot.delete_message(chat_id, message_id),
+            op=f"delete_user_msg:{chat_id}:{message_id}:{context}",
+        )
+        logging.info(
+            "delete_user_msg_ok | chat_id=%s | msg_id=%s | context=%s",
+            chat_id,
+            message_id,
+            context,
+        )
+    except Exception:
+        logging.exception(
+            "delete_user_msg_fail | chat_id=%s | msg_id=%s | context=%s",
+            chat_id,
+            message_id,
+            context,
+        )
+
+
+def delete_user_message(message, context: str = "") -> None:
+    delete_message_by_ids(message.chat.id, message.message_id, context=context)
+
+
+def scheduled_forward_worker() -> None:
+    sent_in_cycle = 0
+    pause_until = 0.0
+
+    while True:
+        try:
+            if not bool_setting("forward_enabled"):
+                sent_in_cycle = 0
+                pause_until = 0.0
+                time.sleep(1.5)
+                continue
+
+            if get_forward_send_mode() != "scheduled":
+                sent_in_cycle = 0
+                pause_until = 0.0
+                time.sleep(1.5)
+                continue
+
+            raw_gid = get_setting("forward_group_id", "")
+            if not raw_gid:
+                time.sleep(1.5)
+                continue
+            gid = int(raw_gid)
+
+            now = time.time()
+            if pause_until > now:
+                time.sleep(min(2.0, pause_until - now))
+                continue
+
+            if sent_in_cycle >= SCHEDULE_BATCH_SIZE:
+                break_seconds = get_schedule_break_seconds()
+                pause_until = time.time() + break_seconds
+                logging.info(
+                    "schedule_pause_start | batch=%s | break_seconds=%s | pending=%s",
+                    SCHEDULE_BATCH_SIZE,
+                    break_seconds,
+                    get_pending_queue_count(),
+                )
+                sent_in_cycle = 0
+                continue
+
+            rows = fetch_pending_queue(SCHEDULE_BATCH_SIZE - sent_in_cycle)
+            if not rows:
+                time.sleep(1.0)
+                continue
+
+            for row in rows:
+                try:
+                    safe_telegram_call(
+                        lambda r=row: bot.forward_message(gid, r["from_chat_id"], r["message_id"]),
+                        op=f"scheduled_fwd:{row['id']}",
+                        max_retries=20,
+                    )
+                    mark_queue_sent(int(row["id"]))
+                    delete_message_by_ids(
+                        int(row["from_chat_id"]),
+                        int(row["message_id"]),
+                        context=f"scheduled:{row['id']}",
+                    )
+                    sent_in_cycle += 1
+                    logging.info(
+                        "schedule_send_ok | row_id=%s | to_group=%s | from_chat=%s | msg_id=%s | sent_in_cycle=%s",
+                        row["id"],
+                        gid,
+                        row["from_chat_id"],
+                        row["message_id"],
+                        sent_in_cycle,
+                    )
+                    if sent_in_cycle >= SCHEDULE_BATCH_SIZE:
+                        break
+                except Exception as e:
+                    mark_queue_failed(int(row["id"]), str(e))
+                    logging.exception(
+                        "schedule_send_fail | row_id=%s | to_group=%s | from_chat=%s | msg_id=%s | err=%s",
+                        row["id"],
+                        gid,
+                        row["from_chat_id"],
+                        row["message_id"],
+                        e,
+                    )
+        except Exception:
+            logging.exception("schedule_worker_loop_fail")
+            time.sleep(2.0)
+
+
+def process_album(chat_id: int, media_group_id: str) -> None:
+    with album_lock:
+        payload = album_buffers.pop((chat_id, media_group_id), None)
+
+    if not payload:
+        return
+
+    retries = int(payload.get("retries", 0))
+    uniq = {m.message_id: m for m in payload["messages"]}
+    messages = sorted(uniq.values(), key=lambda m: m.message_id)
+    if not messages:
+        return
+    logging.info(
+        "album_flush_start | user=%s | chat_id=%s | media_group_id=%s | items=%s | retries=%s",
+        user_tag(messages[0].from_user),
+        chat_id,
+        media_group_id,
+        len(messages),
+        retries,
+    )
+
+    # Late album parts sometimes arrive after initial timeout. Retry a few times.
+    if len(messages) == 1 and retries < 5:
+        retry_delay = 2.0
+        logging.info(
+            "album_flush_retry | user=%s | chat_id=%s | media_group_id=%s | retry=%s | delay=%.1fs",
+            user_tag(messages[0].from_user),
             chat_id,
             media_group_id,
-            update.message.message_id,
-            len(pending_groups[key]["message_ids"]),
+            retries + 1,
+            retry_delay,
         )
+        with album_lock:
+            timer = threading.Timer(retry_delay, process_album, args=(chat_id, media_group_id))
+            album_buffers[(chat_id, media_group_id)] = {
+                "messages": messages,
+                "timer": timer,
+                "retries": retries + 1,
+            }
+            timer.start()
         return
 
-    cooldown = context.application.bot_data.setdefault("user_cooldown", {})
-    last_seen_ts = float(cooldown.get(user_id, 0.0))
-    if now_ts - last_seen_ts < USER_COOLDOWN_SECONDS:
-        return
-    cooldown[user_id] = now_ts
+    media_items = []
 
-    # copy_message keeps it anonymous. If Telegram rejects copy for a media type,
-    # fall back to sending the same media by file_id.
+    for m in messages:
+        media = build_input_media(m)
+        if media:
+            media_items.append(media)
+
+    # If media group cannot be rebuilt (unlikely), fall back to single-message copies.
+    if not media_items:
+        for m in messages:
+            send_clean_single(chat_id, m)
+            maybe_forward_single_to_group(m)
+        return
+
+    sent_count = 0
+    for i in range(0, len(media_items), 10):
+        chunk = media_items[i : i + 10]
+        try:
+            if len(chunk) == 1:
+                logging.info(
+                    "album_chunk_single_fallback | user=%s | chat_id=%s | media_group_id=%s | idx=%s",
+                    user_tag(messages[0].from_user),
+                    chat_id,
+                    media_group_id,
+                    i,
+                )
+                send_clean_single(chat_id, messages[i])
+                sent_count += 1
+            else:
+                safe_telegram_call(
+                    lambda: bot.send_media_group(chat_id, chunk),
+                    op=f"user_album:{chat_id}:{media_group_id}:{i}:{len(chunk)}",
+                    max_retries=20,
+                )
+                sent_count += len(chunk)
+                logging.info(
+                    "album_chunk_send_ok | user=%s | chat_id=%s | media_group_id=%s | chunk_start=%s | chunk_size=%s",
+                    user_tag(messages[0].from_user),
+                    chat_id,
+                    media_group_id,
+                    i,
+                    len(chunk),
+                )
+        except Exception:
+            logging.exception(
+                "album_chunk_send_fail | user=%s | chat_id=%s | media_group_id=%s | chunk_start=%s | chunk_size=%s",
+                user_tag(messages[0].from_user),
+                chat_id,
+                media_group_id,
+                i,
+                len(chunk),
+            )
+            for j in range(i, i + len(chunk)):
+                send_clean_single(chat_id, messages[j])
+                sent_count += 1
+    if sent_count:
+        inc_total_media(sent_count)
+    logging.info(
+        "album_flush_done | user=%s | chat_id=%s | media_group_id=%s | delivered=%s",
+        user_tag(messages[0].from_user),
+        chat_id,
+        media_group_id,
+        sent_count,
+    )
+
+    if bool_setting("forward_enabled"):
+        raw_gid = get_setting("forward_group_id", "")
+        if raw_gid:
+            gid = int(raw_gid)
+            maybe_forward_album_to_group(messages, gid, media_group_id)
+
+    # In scheduled mode we must keep source messages until worker forwards them.
+    if not (bool_setting("forward_enabled") and get_forward_send_mode() == "scheduled"):
+        for m in messages:
+            delete_user_message(m, context=f"album:{media_group_id}")
+
+
+def queue_album_message(message) -> None:
+    key = (message.chat.id, message.media_group_id)
+    flush_delay = 2.0
+
+    with album_lock:
+        if key not in album_buffers:
+            timer = threading.Timer(
+                flush_delay, process_album, args=(message.chat.id, message.media_group_id)
+            )
+            album_buffers[key] = {"messages": [message], "timer": timer, "retries": 0}
+            timer.start()
+            logging.info(
+                "album_queue_new | user=%s | chat_id=%s | media_group_id=%s | msg_id=%s | delay=%.1fs",
+                user_tag(message.from_user),
+                message.chat.id,
+                message.media_group_id,
+                message.message_id,
+                flush_delay,
+            )
+        else:
+            album_buffers[key]["messages"].append(message)
+            album_buffers[key]["retries"] = 0
+            # Debounce flush so late parts of the same album are still grouped.
+            old_timer = album_buffers[key].get("timer")
+            if old_timer:
+                try:
+                    old_timer.cancel()
+                except Exception:
+                    pass
+            new_timer = threading.Timer(
+                flush_delay, process_album, args=(message.chat.id, message.media_group_id)
+            )
+            album_buffers[key]["timer"] = new_timer
+            new_timer.start()
+            logging.info(
+                "album_queue_append | user=%s | chat_id=%s | media_group_id=%s | msg_id=%s | total_buffered=%s",
+                user_tag(message.from_user),
+                message.chat.id,
+                message.media_group_id,
+                message.message_id,
+                len(album_buffers[key]["messages"]),
+            )
+
+
+# -----------------------------
+# Admin actions
+# -----------------------------
+def show_stats(chat_id: int) -> None:
+    bot.send_message(
+        chat_id,
+        f"📊 <b>Stats</b>\n\n"
+        f"👥 Users: <b>{get_user_count()}</b>\n"
+        f"🎞 Total Media Sent: <b>{get_total_media()}</b>",
+    )
+
+
+def read_recent_logs(max_lines: int = 30) -> str:
     try:
-        await update.message.copy(chat_id=chat_id)
-        return
-    except Exception as exc:
-        logger.warning("Anonymous copy failed for message_id=%s: %s", update.message.message_id, exc)
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        if not lines:
+            return "No logs yet."
+        return "".join(lines[-max_lines:]).rstrip() or "No logs yet."
+    except FileNotFoundError:
+        return f"Log file not found: {LOG_FILE}"
+    except Exception as e:
+        return f"Failed to read logs: {e}"
 
-    msg = update.message
-    if msg.text:
-        await context.bot.send_message(chat_id=chat_id, text=msg.text)
-    elif msg.photo:
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=msg.photo[-1].file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
+
+def toggle_setting_with_feedback(chat_id: int, key: str, label: str) -> None:
+    new_val = "0" if bool_setting(key) else "1"
+    set_setting(key, new_val)
+    human = "ON" if new_val == "1" else "OFF"
+    bot.send_message(chat_id, f"{label} is now <b>{human}</b>.")
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def on_callback(call) -> None:
+    user_id = call.from_user.id
+
+    # User-side callback: firewall re-check
+    if call.data == "user:check_join":
+        if firewall_allows(call.message, user_id=call.from_user.id):
+            bot.answer_callback_query(call.id, "Access granted ✅")
+            bot.send_message(call.message.chat.id, "✅ You're verified. Send media/text now.")
+        else:
+            bot.answer_callback_query(call.id, "Still not joined")
+        return
+
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "Not allowed", show_alert=False)
+        return
+
+    if not call.data.startswith("admin:"):
+        return
+
+    action = call.data.split(":", 1)[1]
+    if action == "users_list":
+        bot.answer_callback_query(call.id, "Loading users...")
+
+        users = get_all_users()
+
+        if not users:
+            bot.send_message(call.message.chat.id, "No users found.")
+            return
+
+        text = "<b>👥 Users List</b>\n\n"
+
+        for uid, uname, fname, lname in users:
+            full_name = f"{fname} {lname}".strip() or "No Name"
+            media_count = get_user_media_count(uid)
+
+            text += (
+                f"👤 {full_name} (@{uname}) | <code>{uid}</code>\n"
+                f"📦 Media Sent: {media_count}\n\n"
+            )
+
+        # Telegram limit safe
+        for i in range(0, len(text), 4000):
+            bot.send_message(call.message.chat.id, text[i:i+4000])
+
+        return
+
+    if action == "stats":
+        bot.answer_callback_query(call.id, "Stats updated")
+        try:
+            bot.edit_message_text(
+                panel_text(),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=main_admin_keyboard(),
+            )
+        except Exception:
+            send_admin_panel(call.message.chat.id)
+        return
+
+    if action == "broadcast":
+        admin_pending_actions[user_id] = "broadcast"
+        bot.answer_callback_query(call.id, "Broadcast mode")
+        bot.send_message(
+            call.message.chat.id,
+            "📢 Send one message now (text/media). It will be broadcast to all users."
+            "\nSend /cancel to stop.",
         )
-    elif msg.video:
-        await context.bot.send_video(
-            chat_id=chat_id,
-            video=msg.video.file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
+        return
+
+    if action == "toggle_firewall":
+        toggle_setting_with_feedback(call.message.chat.id, "firewall_enabled", "🔥 Firewall")
+        bot.answer_callback_query(call.id, "Toggled")
+        send_admin_panel(call.message.chat.id)
+        return
+
+    if action == "toggle_forward":
+        toggle_setting_with_feedback(call.message.chat.id, "forward_enabled", "📤 Forward mode")
+        bot.answer_callback_query(call.id, "Toggled")
+        send_admin_panel(call.message.chat.id)
+        return
+
+    if action == "media_send_menu":
+        bot.answer_callback_query(call.id)
+        mode = get_forward_send_mode().upper()
+        break_hours = round(get_schedule_break_seconds() / 3600, 2)
+        bot.send_message(
+            call.message.chat.id,
+            (
+                "<b>📮 Media Send Settings</b>\n\n"
+                f"<b>Current Mode:</b> {mode}\n"
+                f"<b>Batch:</b> {SCHEDULE_BATCH_SIZE}\n"
+                f"<b>Break Hours:</b> {break_hours}\n"
+                f"<b>Queue Pending:</b> {get_pending_queue_count()}\n\n"
+                "Automatic: forwards immediately (current behavior).\n"
+                "Scheduled: sends 100 messages, then pauses for break time."
+            ),
+            reply_markup=media_send_keyboard(),
         )
-    elif msg.document:
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=msg.document.file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
+        return
+
+    if action == "file_ids_menu":
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            (
+                "<b>💾 File IDs Storage</b>\n\n"
+                f"<b>Total Saved:</b> {get_file_ids_count()}\n"
+                f"<b>CSV File:</b> <code>{FILE_IDS_CSV}</code>\n\n"
+                "Export: download all saved file_ids.\n"
+                "Import: upload a CSV to merge file_ids."
+            ),
+            reply_markup=file_ids_keyboard(),
         )
-    elif msg.voice:
-        await context.bot.send_voice(chat_id=chat_id, voice=msg.voice.file_id, caption=msg.caption)
-    elif msg.audio:
-        await context.bot.send_audio(
-            chat_id=chat_id,
-            audio=msg.audio.file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
+        return
+
+    if action == "file_ids_export":
+        bot.answer_callback_query(call.id, "Preparing CSV")
+        rebuild_file_ids_csv_from_db()
+        try:
+            with open(FILE_IDS_CSV, "rb") as f:
+                safe_telegram_call(
+                    lambda: (
+                        f.seek(0),
+                        bot.send_document(
+                            call.message.chat.id,
+                            f,
+                            caption=f"💾 File IDs Export\nTotal: {get_file_ids_count()}",
+                        ),
+                    )[1],
+                    op=f"file_ids_export:{call.message.chat.id}",
+                )
+        except Exception:
+            logging.exception("file_ids_export_fail")
+            bot.send_message(call.message.chat.id, "❌ Failed to export CSV.")
+        return
+
+    if action == "file_ids_import":
+        admin_pending_actions[user_id] = "file_ids_import"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            "📥 Send CSV file now to import file_ids.\nUse /cancel to stop.",
         )
-    elif msg.sticker:
-        await context.bot.send_sticker(chat_id=chat_id, sticker=msg.sticker.file_id)
-    elif msg.animation:
-        await context.bot.send_animation(
-            chat_id=chat_id,
-            animation=msg.animation.file_id,
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
+        return
+
+    if action == "send_mode_auto":
+        set_setting("forward_send_mode", "auto")
+        bot.answer_callback_query(call.id, "Automatic mode enabled")
+        send_admin_panel(call.message.chat.id)
+        return
+
+    if action == "send_mode_scheduled":
+        set_setting("forward_send_mode", "scheduled")
+        bot.answer_callback_query(call.id, "Scheduled mode enabled")
+        send_admin_panel(call.message.chat.id)
+        return
+
+    if action == "set_break_time":
+        admin_pending_actions[user_id] = "set_break_time"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            "🕒 Send break time in hours (example: <code>2</code> or <code>1.5</code>).",
         )
-    elif msg.video_note:
-        await context.bot.send_video_note(chat_id=chat_id, video_note=msg.video_note.file_id)
+        return
+
+    if action == "recent_logs":
+        bot.answer_callback_query(call.id, "Loading logs")
+        logs = read_recent_logs(30)
+        # Use plain text so log characters are shown exactly as-is.
+        bot.send_message(call.message.chat.id, f"🧾 Recent Logs\n\n{logs}", parse_mode=None)
+        return
+
+    if action == "set_group_menu":
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            "⚙️ Choose which group you want to set:",
+            reply_markup=group_menu_keyboard(),
+        )
+        return
+
+    if action == "set_fw_group":
+        admin_pending_actions[user_id] = "set_fw_group"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            "🛡 Send firewall group ID (example: <code>-1001234567890</code>)"
+            "\nOr forward any message from that group here.",
+        )
+        return
+
+    if action == "set_fwd_group":
+        admin_pending_actions[user_id] = "set_fwd_group"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            "📥 Send forward group ID (example: <code>-1001234567890</code>)"
+            "\nOr forward any message from that group here.",
+        )
+        return
+
+    if action in ("back_main", "refresh"):
+        bot.answer_callback_query(call.id)
+        send_admin_panel(call.message.chat.id)
+        return
+
+
+def parse_group_id_from_message(message) -> Optional[int]:
+    if message.text and message.text.strip().lstrip("-").isdigit():
+        return int(message.text.strip())
+
+    fchat = getattr(message, "forward_from_chat", None)
+    if fchat:
+        return int(fchat.id)
+
+    if getattr(message, "sender_chat", None):
+        return int(message.sender_chat.id)
+
+    return None
+
+
+def process_admin_pending(message) -> bool:
+    uid = message.from_user.id
+    if uid not in admin_pending_actions:
+        return False
+
+    action = admin_pending_actions[uid]
+
+    if message.text and message.text.strip().lower() == "/cancel":
+        admin_pending_actions.pop(uid, None)
+        bot.reply_to(message, "❌ Pending admin action cancelled.")
+        return True
+
+    if action == "set_fw_group":
+        gid = parse_group_id_from_message(message)
+        if gid is None:
+            bot.reply_to(message, "Invalid input. Send a group ID or forward a group message.")
+            return True
+
+        set_setting("firewall_group_id", str(gid))
+        set_setting("firewall_join_link", "")
+        admin_pending_actions.pop(uid, None)
+        bot.reply_to(message, f"✅ Firewall group set to <code>{gid}</code>")
+        send_admin_panel(message.chat.id)
+        return True
+
+    if action == "set_fwd_group":
+        gid = parse_group_id_from_message(message)
+        if gid is None:
+            bot.reply_to(message, "Invalid input. Send a group ID or forward a group message.")
+            return True
+
+        set_setting("forward_group_id", str(gid))
+        admin_pending_actions.pop(uid, None)
+        bot.reply_to(message, f"✅ Forward group set to <code>{gid}</code>")
+        send_admin_panel(message.chat.id)
+        return True
+
+    if action == "broadcast":
+        admin_pending_actions.pop(uid, None)
+        user_ids = get_all_user_ids()
+        ok = 0
+        fail = 0
+
+        for user_id in user_ids:
+            try:
+                bot.copy_message(user_id, message.chat.id, message.message_id)
+                ok += 1
+            except Exception:
+                fail += 1
+
+        bot.reply_to(
+            message,
+            f"📢 Broadcast finished.\n✅ Sent: <b>{ok}</b>\n❌ Failed: <b>{fail}</b>",
+        )
+        return True
+
+    if action == "file_ids_import":
+        if not message.document:
+            bot.reply_to(message, "Please send a CSV document file.")
+            return True
+        file_name = (message.document.file_name or "").lower()
+        if not file_name.endswith(".csv"):
+            bot.reply_to(message, "Invalid file type. Please send a .csv file.")
+            return True
+        try:
+            tg_file = bot.get_file(message.document.file_id)
+            file_bytes = bot.download_file(tg_file.file_path)
+            added, skipped = import_file_ids_csv_bytes(file_bytes)
+            admin_pending_actions.pop(uid, None)
+            bot.reply_to(
+                message,
+                f"✅ CSV imported.\nAdded: <b>{added}</b>\nSkipped: <b>{skipped}</b>\nTotal: <b>{get_file_ids_count()}</b>",
+            )
+            send_admin_panel(message.chat.id)
+        except Exception as e:
+            logging.exception("file_ids_import_fail | err=%s", e)
+            bot.reply_to(message, "❌ Failed to import CSV. Please check format and try again.")
+        return True
+
+    if action == "set_break_time":
+        raw = (message.text or "").strip()
+        try:
+            hours = float(raw)
+        except Exception:
+            bot.reply_to(message, "Invalid value. Send a number like 2 or 1.5")
+            return True
+        if hours <= 0:
+            bot.reply_to(message, "Break hours must be greater than 0.")
+            return True
+        seconds = int(hours * 3600)
+        set_setting("schedule_break_seconds", str(seconds))
+        admin_pending_actions.pop(uid, None)
+        bot.reply_to(
+            message,
+            f"✅ Scheduled break set to <b>{hours}</b> hour(s).",
+        )
+        send_admin_panel(message.chat.id)
+        return True
+
+    return False
+
+
+# -----------------------------
+# Commands + message routing
+# -----------------------------
+@bot.message_handler(commands=["start", "admin"])
+def on_start(message) -> None:
+    if message.chat.type != "private":
+        return
+
+    upsert_user(message.from_user)
+
+    if is_admin(message.from_user.id):
+        send_admin_panel(message.chat.id)
+        return
+
+    bot.send_message(
+        message.chat.id,
+        "👋 Welcome to Anonymous Forward Bot.Send me any message\nphoto\nvideo\ndocument\nvoice or sticker \nI will forward it back to you anonymously.",
+    )
+
+
+@bot.message_handler(commands=["cancel"])
+def on_cancel(message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+
+    if admin_pending_actions.pop(message.from_user.id, None):
+        bot.reply_to(message, "❌ Pending action cancelled.")
     else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⚠️ I received your message, but this media type is not supported for anonymous echo yet.",
-        )
+        bot.reply_to(message, "No pending action.")
 
 
-async def main_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if (
-        context.user_data.get("awaiting_broadcast")
-        and is_admin(update, context.bot_data["admin_user_id"])
-    ):
-        await handle_broadcast_input(update, context)
+@bot.message_handler(
+    content_types=[
+        "text",
+        "photo",
+        "video",
+        "document",
+        "audio",
+        "voice",
+        "sticker",
+        "animation",
+    ]
+)
+def on_private_message(message) -> None:
+    if message.chat.type != "private":
         return
-    await anonymous_forward(update, context)
 
-
-def main():
-    # token = os.getenv("TELEGRAM_BOT_TOKEN")
-    token = "8647557552:AAEYbCBHPD6gdt4Zy2wlJzQSiTw9oYGdelY"
-    admin_user_id = 8503526321
-
-    db_dsn = get_db_dsn()
-    init_db(db_dsn)
-
-    application = Application.builder().token(token).build()
-    application.bot_data["db_path"] = db_dsn
-    application.bot_data["admin_user_id"] = admin_user_id
-
-    application.add_error_handler(on_error)
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", admin))
-    application.add_handler(CommandHandler("ban", ban_command))
-    application.add_handler(CommandHandler("unban", unban_command))
-    application.add_handler(
-        CallbackQueryHandler(admin_callbacks, pattern=f"^{ADMIN_MENU_PREFIX}")
-    )
-    application.add_handler(
-        MessageHandler(filters.ALL & ~filters.COMMAND, main_message_handler)
+    upsert_user(message.from_user)
+    logging.info(
+        "incoming_private | user=%s | chat_id=%s | msg_id=%s | type=%s | media_group_id=%s",
+        user_tag(message.from_user),
+        message.chat.id,
+        message.message_id,
+        message.content_type,
+        message.media_group_id,
     )
 
-    port = int(os.environ.get("PORT", 10000))
+    if is_admin(message.from_user.id) and process_admin_pending(message):
+        return
 
-    # VERY IMPORTANT
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=token,
-        webhook_url=f"https://anon.onrender.com/{token}",
-        drop_pending_updates=True,
+    if is_admin(message.from_user.id):
+        # Admin normal messages are ignored unless they are in a pending flow.
+        return
+
+    record_file_id_from_message(message)
+
+    if not firewall_allows(message):
+        delete_user_message(message, context="blocked_firewall")
+        return
+
+    # User message flow: clean sendback + optional forward mode.
+    if message.media_group_id and message.content_type in ("photo", "video", "document", "audio"):
+        queue_album_message(message)
+        return
+
+    send_clean_single(message.chat.id, message)
+    maybe_forward_single_to_group(message)
+    if not (bool_setting("forward_enabled") and get_forward_send_mode() == "scheduled"):
+        delete_user_message(message, context="single")
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return "ok", 200
+
+
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def telegram_webhook():
+    if WEBHOOK_SECRET_TOKEN:
+        received_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if received_token != WEBHOOK_SECRET_TOKEN:
+            logging.warning("webhook_forbidden | reason=bad_secret_token")
+            abort(403)
+
+    try:
+        update = telebot.types.Update.de_json(request.get_data(as_text=True))
+        bot.process_new_updates([update])
+    except Exception:
+        logging.exception("webhook_update_process_fail")
+        return "error", 500
+    return "ok", 200
+
+
+def configure_webhook() -> None:
+    if not WEBHOOK_URL:
+        raise RuntimeError(
+            "WEBHOOK_URL is required for webhook mode. Example: https://your-domain.com"
+        )
+    webhook_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
+    safe_telegram_call(lambda: bot.remove_webhook(), op="remove_webhook", max_retries=3)
+    safe_telegram_call(
+        lambda: bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET_TOKEN if WEBHOOK_SECRET_TOKEN else None,
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query"],
+        ),
+        op="set_webhook",
+        max_retries=5,
     )
+    logging.info("webhook_set | url=%s | path=%s", webhook_url, WEBHOOK_PATH)
+
+
+def main() -> None:
+    setup_logging()
+    init_db()
+    threading.Thread(target=scheduled_forward_worker, daemon=True).start()
+    configure_webhook()
+    logging.info(
+        "bot_start_webhook | db_path=%s | log_file=%s | log_level=%s | listen=%s | port=%s | path=%s",
+        DB_PATH,
+        LOG_FILE,
+        LOG_LEVEL,
+        WEBHOOK_LISTEN,
+        WEBHOOK_PORT,
+        WEBHOOK_PATH,
+    )
+    app.run(host=WEBHOOK_LISTEN, port=WEBHOOK_PORT)
 
 
 if __name__ == "__main__":

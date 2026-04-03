@@ -1,2 +1,4 @@
-python-telegram-bot[webhooks]==20.8
-psycopg[binary]
+pyTelegramBotAPI
+psycopg2-binary
+python-telegram-bot==20.7
+pyTelegramBotAPI

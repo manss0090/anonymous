@@ -184,6 +184,8 @@ def init_db() -> None:
             )
             """
         )
+        
+        
         conn.commit()
 
         defaults = {
@@ -1660,9 +1662,16 @@ def on_private_message(message) -> None:
 #     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
 
 
-bot.remove_webhook()
+def main():
+    setup_logging()
+    init_db()
 
-bot.infinity_polling(skip_pending=True)
+    bot.remove_webhook()
+
+    threading.Thread(target=scheduled_forward_worker, daemon=True).start()
+
+    logging.info("Bot started...")
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
 
 
 if __name__ == "__main__":

@@ -1647,17 +1647,22 @@ def on_private_message(message) -> None:
         delete_user_message(message, context="single")
 
 
-def main() -> None:
-    setup_logging()
-    init_db()
-    threading.Thread(target=scheduled_forward_worker, daemon=True).start()
-    logging.info(
-        "bot_start | db_path=%s | log_file=%s | log_level=%s",
-        DB_PATH,
-        LOG_FILE,
-        LOG_LEVEL,
-    )
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+# def main() -> None:
+#     setup_logging()
+#     init_db()
+#     threading.Thread(target=scheduled_forward_worker, daemon=True).start()
+#     logging.info(
+#         "bot_start | db_path=%s | log_file=%s | log_level=%s",
+#         DB_PATH,
+#         LOG_FILE,
+#         LOG_LEVEL,
+#     )
+#     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+
+
+bot.remove_webhook()
+
+bot.infinity_polling(skip_pending=True)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ ADMIN_ID_ENV = os.getenv("ADMIN_ID", "").strip()
 LOG_FILE = os.getenv("LOG_FILE", "newanon.log").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 FILE_IDS_CSV = os.getenv("FILE_IDS_CSV", "file_ids.csv").strip()
+USERS_CSV = os.getenv("USERS_CSV", "users.csv").strip()
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 db_lock = threading.Lock()
@@ -38,6 +39,7 @@ album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
 admin_pending_actions: Dict[int, str] = {}
 send_lock = threading.Lock()
 file_ids_lock = threading.Lock()
+users_csv_lock = threading.Lock()
 last_send_ts = 0.0
 MIN_SEND_GAP = float(os.getenv("MIN_SEND_GAP", "0.10"))
 SEND_MAX_RETRIES = int(os.getenv("SEND_MAX_RETRIES", "6"))
@@ -184,8 +186,6 @@ def init_db() -> None:
             )
             """
         )
-        
-        
         conn.commit()
 
         defaults = {
@@ -294,6 +294,91 @@ def ensure_file_ids_csv_header() -> None:
                     "created_at",
                 ]
             )
+
+
+def rebuild_users_csv_from_db() -> int:
+    with db_lock:
+        rows = conn.execute(
+            """
+            SELECT
+                u.user_id,
+                u.username,
+                u.first_seen,
+                u.last_seen,
+                (
+                    SELECT COUNT(*)
+                    FROM file_ids f
+                    WHERE f.user_id = u.user_id
+                ) AS media_count
+            FROM users u
+            ORDER BY u.user_id ASC
+            """
+        ).fetchall()
+    with users_csv_lock:
+        with open(USERS_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["user_id", "username", "media_count", "first_seen", "last_seen"])
+            for r in rows:
+                w.writerow(
+                    [
+                        r["user_id"],
+                        r["username"] or "",
+                        r["media_count"] if r["media_count"] is not None else 0,
+                        r["first_seen"] if r["first_seen"] is not None else "",
+                        r["last_seen"] if r["last_seen"] is not None else "",
+                    ]
+                )
+    return len(rows)
+
+
+def import_users_csv_bytes(file_bytes: bytes) -> Tuple[int, int]:
+    text = file_bytes.decode("utf-8", errors="replace")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return 0, 0
+
+    reader = csv.DictReader(lines)
+    imported = 0
+    skipped = 0
+    now = int(time.time())
+
+    with db_lock:
+        for row in reader:
+            user_id_raw = (row.get("user_id") or row.get("USER_ID") or "").strip()
+            if not user_id_raw or not user_id_raw.lstrip("-").isdigit():
+                skipped += 1
+                continue
+
+            user_id = int(user_id_raw)
+            username = (row.get("username") or row.get("USERNAME") or "").strip()
+            first_seen_raw = (row.get("first_seen") or "").strip()
+            last_seen_raw = (row.get("last_seen") or "").strip()
+            try:
+                first_seen = int(first_seen_raw) if first_seen_raw else now
+            except Exception:
+                first_seen = now
+            try:
+                last_seen = int(last_seen_raw) if last_seen_raw else now
+            except Exception:
+                last_seen = now
+
+            conn.execute(
+                """
+                INSERT INTO users(user_id, username, first_seen, last_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = CASE
+                        WHEN excluded.username != '' THEN excluded.username
+                        ELSE users.username
+                    END,
+                    first_seen = MIN(users.first_seen, excluded.first_seen),
+                    last_seen = MAX(users.last_seen, excluded.last_seen)
+                """,
+                (user_id, username, first_seen, last_seen),
+            )
+            imported += 1
+        conn.commit()
+    return imported, skipped
 
 
 def get_file_ids_count() -> int:
@@ -592,7 +677,7 @@ def main_admin_keyboard() -> InlineKeyboardMarkup:
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("📊 Stats", callback_data="admin:stats"),
+        InlineKeyboardButton("🏆 leaderboard", callback_data="admin:stats"),
         InlineKeyboardButton("👥 Users List", callback_data="admin:users_list"),
     )
     kb.add(
@@ -635,6 +720,8 @@ def file_ids_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("📤 Export CSV", callback_data="admin:file_ids_export"),
         InlineKeyboardButton("📥 Import CSV", callback_data="admin:file_ids_import"),
     )
+    kb.add(InlineKeyboardButton("👥 Export Users CSV", callback_data="admin:users_export"))
+    kb.add(InlineKeyboardButton("👤 Import Users CSV", callback_data="admin:users_import"))
     kb.add(InlineKeyboardButton("⬅️ Back", callback_data="admin:back_main"))
     return kb
 
@@ -1273,18 +1360,17 @@ def on_callback(call) -> None:
 
         text = "<b>👥 Users List</b>\n\n"
 
-        #for uid, uname in users:
-            #text += f"👤 {uname} | <code>{uid}</code>\n"
-        for uid, uname, fname, lname in users:
-            full_name = f"{fname} {lname}".strip() or "No Name"
-            media_count = get_user_media_count(uid)
+        for uid, uname in users:
+            try:
+                media_count = get_user_media_count(uid)
+            except:
+                media_count = 0
 
             text += (
-                f"👤 {full_name} (@{uname}) | <code>{uid}</code>\n"
-                f"📦 Media Sent: {media_count}\n\n"
+                f"👤 @{uname} | <code>{uid}</code> | 🎬 Media: {media_count}\n"
             )
 
-        # Telegram message limit fix
+        # Telegram limit safe
         for i in range(0, len(text), 4000):
             bot.send_message(call.message.chat.id, text[i:i+4000])
 
@@ -1353,7 +1439,9 @@ def on_callback(call) -> None:
                 f"<b>Total Saved:</b> {get_file_ids_count()}\n"
                 f"<b>CSV File:</b> <code>{FILE_IDS_CSV}</code>\n\n"
                 "Export: download all saved file_ids.\n"
-                "Import: upload a CSV to merge file_ids."
+                "Import: upload a CSV to merge file_ids.\n"
+                "Users Export: download all users as CSV.\n"
+                "Users Import: upload users CSV to merge users."
             ),
             reply_markup=file_ids_keyboard(),
         )
@@ -1378,6 +1466,36 @@ def on_callback(call) -> None:
         except Exception:
             logging.exception("file_ids_export_fail")
             bot.send_message(call.message.chat.id, "❌ Failed to export CSV.")
+        return
+
+    if action == "users_export":
+        bot.answer_callback_query(call.id, "Preparing users CSV")
+        total_users = rebuild_users_csv_from_db()
+        try:
+            with open(USERS_CSV, "rb") as f:
+                safe_telegram_call(
+                    lambda: (
+                        f.seek(0),
+                        bot.send_document(
+                            call.message.chat.id,
+                            f,
+                            caption=f"👥 Users Export\nTotal Users: {total_users}",
+                        ),
+                    )[1],
+                    op=f"users_export:{call.message.chat.id}",
+                )
+        except Exception:
+            logging.exception("users_export_fail")
+            bot.send_message(call.message.chat.id, "❌ Failed to export users CSV.")
+        return
+
+    if action == "users_import":
+        admin_pending_actions[user_id] = "users_import"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            "👤 Send users CSV file now to import users.\nUse /cancel to stop.",
+        )
         return
 
     if action == "file_ids_import":
@@ -1545,6 +1663,29 @@ def process_admin_pending(message) -> bool:
             bot.reply_to(message, "❌ Failed to import CSV. Please check format and try again.")
         return True
 
+    if action == "users_import":
+        if not message.document:
+            bot.reply_to(message, "Please send a CSV document file.")
+            return True
+        file_name = (message.document.file_name or "").lower()
+        if not file_name.endswith(".csv"):
+            bot.reply_to(message, "Invalid file type. Please send a .csv file.")
+            return True
+        try:
+            tg_file = bot.get_file(message.document.file_id)
+            file_bytes = bot.download_file(tg_file.file_path)
+            imported, skipped = import_users_csv_bytes(file_bytes)
+            admin_pending_actions.pop(uid, None)
+            bot.reply_to(
+                message,
+                f"✅ Users CSV imported.\nImported: <b>{imported}</b>\nSkipped: <b>{skipped}</b>\nTotal Users: <b>{get_user_count()}</b>",
+            )
+            send_admin_panel(message.chat.id)
+        except Exception as e:
+            logging.exception("users_import_fail | err=%s", e)
+            bot.reply_to(message, "❌ Failed to import users CSV. Please check format and try again.")
+        return True
+
     if action == "set_break_time":
         raw = (message.text or "").strip()
         try:
@@ -1649,28 +1790,16 @@ def on_private_message(message) -> None:
         delete_user_message(message, context="single")
 
 
-# def main() -> None:
-#     setup_logging()
-#     init_db()
-#     threading.Thread(target=scheduled_forward_worker, daemon=True).start()
-#     logging.info(
-#         "bot_start | db_path=%s | log_file=%s | log_level=%s",
-#         DB_PATH,
-#         LOG_FILE,
-#         LOG_LEVEL,
-#     )
-#     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
-
-
-def main():
+def main() -> None:
     setup_logging()
     init_db()
-
-    bot.remove_webhook()
-
     threading.Thread(target=scheduled_forward_worker, daemon=True).start()
-
-    logging.info("Bot started...")
+    logging.info(
+        "bot_start | db_path=%s | log_file=%s | log_level=%s",
+        DB_PATH,
+        LOG_FILE,
+        LOG_LEVEL,
+    )
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
 
 

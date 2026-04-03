@@ -8,7 +8,6 @@ import csv
 from typing import Any, Dict, List, Optional, Tuple
 
 import telebot
-from flask import Flask, abort, request
 from telebot.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -29,14 +28,8 @@ ADMIN_ID_ENV = os.getenv("ADMIN_ID", "").strip()
 LOG_FILE = os.getenv("LOG_FILE", "newanon.log").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 FILE_IDS_CSV = os.getenv("FILE_IDS_CSV", "file_ids.csv").strip()
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
-WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0").strip() or "0.0.0.0"
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-app = Flask(__name__)
 db_lock = threading.Lock()
 album_lock = threading.Lock()
 
@@ -597,7 +590,7 @@ def main_admin_keyboard() -> InlineKeyboardMarkup:
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("🏆 leaderboard", callback_data="admin:stats"),
+        InlineKeyboardButton("📊 Stats", callback_data="admin:stats"),
         InlineKeyboardButton("👥 Users List", callback_data="admin:users_list"),
     )
     kb.add(
@@ -1278,6 +1271,8 @@ def on_callback(call) -> None:
 
         text = "<b>👥 Users List</b>\n\n"
 
+        #for uid, uname in users:
+            #text += f"👤 {uname} | <code>{uid}</code>\n"
         for uid, uname, fname, lname in users:
             full_name = f"{fname} {lname}".strip() or "No Name"
             media_count = get_user_media_count(uid)
@@ -1287,7 +1282,7 @@ def on_callback(call) -> None:
                 f"📦 Media Sent: {media_count}\n\n"
             )
 
-        # Telegram limit safe
+        # Telegram message limit fix
         for i in range(0, len(text), 4000):
             bot.send_message(call.message.chat.id, text[i:i+4000])
 
@@ -1652,63 +1647,17 @@ def on_private_message(message) -> None:
         delete_user_message(message, context="single")
 
 
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return "ok", 200
-
-
-@app.route(WEBHOOK_PATH, methods=["POST"])
-def telegram_webhook():
-    if WEBHOOK_SECRET_TOKEN:
-        received_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if received_token != WEBHOOK_SECRET_TOKEN:
-            logging.warning("webhook_forbidden | reason=bad_secret_token")
-            abort(403)
-
-    try:
-        update = telebot.types.Update.de_json(request.get_data(as_text=True))
-        bot.process_new_updates([update])
-    except Exception:
-        logging.exception("webhook_update_process_fail")
-        return "error", 500
-    return "ok", 200
-
-
-def configure_webhook() -> None:
-    if not WEBHOOK_URL:
-        raise RuntimeError(
-            "WEBHOOK_URL is required for webhook mode. Example: https://your-domain.com"
-        )
-    webhook_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
-    safe_telegram_call(lambda: bot.remove_webhook(), op="remove_webhook", max_retries=3)
-    safe_telegram_call(
-        lambda: bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET_TOKEN if WEBHOOK_SECRET_TOKEN else None,
-            drop_pending_updates=True,
-            allowed_updates=["message", "callback_query"],
-        ),
-        op="set_webhook",
-        max_retries=5,
-    )
-    logging.info("webhook_set | url=%s | path=%s", webhook_url, WEBHOOK_PATH)
-
-
 def main() -> None:
     setup_logging()
     init_db()
     threading.Thread(target=scheduled_forward_worker, daemon=True).start()
-    configure_webhook()
     logging.info(
-        "bot_start_webhook | db_path=%s | log_file=%s | log_level=%s | listen=%s | port=%s | path=%s",
+        "bot_start | db_path=%s | log_file=%s | log_level=%s",
         DB_PATH,
         LOG_FILE,
         LOG_LEVEL,
-        WEBHOOK_LISTEN,
-        WEBHOOK_PORT,
-        WEBHOOK_PATH,
     )
-    app.run(host=WEBHOOK_LISTEN, port=WEBHOOK_PORT)
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
 
 
 if __name__ == "__main__":
